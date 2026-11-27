@@ -1281,6 +1281,60 @@ namespace esp {
 		g_nearest_plot = next_plot;
 	}
 
+	inline int world_label_len( const char* s ) {
+		int n = 0;
+		while ( s && s[ n ] ) ++n;
+		return n;
+	}
+
+	// Item labels arrive as engine ids: LootItemBeanCan, item_bean_can, CannedBeans01.
+	// Rendering those raw is most of why the world ESP reads as noise, so the id is
+	// made readable once, at projection, instead of every frame at draw.
+	inline void pretty_world_label( const char* in, char* out, size_t cap ) {
+		if ( !out || cap < 2 ) return;
+		out[ 0 ] = '\0';
+		if ( !in || !in[ 0 ] ) return;
+
+		static const char* const k_prefix[] = { "LootItem", "LootNode", "Lootable", "Loot", "WorldEntity", "Entity", "Item" };
+		const char* s = in;
+		for ( int p = 0; p < 7; ++p ) {
+			const int pl = world_label_len( k_prefix[ p ] );
+			bool match = true;
+			for ( int i = 0; i < pl; ++i ) {
+				if ( s[ i ] != k_prefix[ p ][ i ] ) {
+					match = false;
+					break;
+				}
+			}
+			if ( !match ) continue;
+			// Only strip when the prefix ends a word, so "Carcass" keeps its C.
+			const char nxt = s[ pl ];
+			if ( ( nxt >= 'A' && nxt <= 'Z' ) || nxt == '_' ) {
+				s += pl;
+				break;
+			}
+		}
+		if ( s[ 0 ] == '_' ) ++s;
+
+		size_t o = 0;
+		char prev = 0;
+		for ( int i = 0; s[ i ] && o + 2 < cap; ++i ) {
+			const char ch = s[ i ];
+			if ( ch == '_' || ch == '-' ) {
+				if ( o > 0 && out[ o - 1 ] != ' ' ) out[ o++ ] = ' ';
+				prev = ' ';
+				continue;
+			}
+			const bool upper = ( ch >= 'A' && ch <= 'Z' );
+			const bool prev_word = ( prev >= 'a' && prev <= 'z' ) || ( prev >= '0' && prev <= '9' );
+			if ( upper && prev_word && o > 0 && out[ o - 1 ] != ' ' ) out[ o++ ] = ' ';
+			out[ o++ ] = ch;
+			prev = ch;
+		}
+		while ( o > 0 && out[ o - 1 ] == ' ' ) --o;
+		out[ o ] = '\0';
+	}
+
 	inline void project_world_cache( ) {
 		const LONG w_back = 1 - InterlockedCompareExchange( &g_world_active_buf, 0, 0 );
 		if ( !config::world_master ) {
@@ -1317,7 +1371,7 @@ namespace esp {
 			wi.category = raw.category;
 			wi.rarity = raw.rarity;
 			wi.is_empty = raw.is_empty;
-			copy_str( wi.label, sizeof( wi.label ), raw.label );
+			pretty_world_label( raw.label, wi.label, sizeof( wi.label ) );
 			wi.valid = true;
 		}
 		g_world_count_buf[ w_back ] = w_cnt;
@@ -2243,26 +2297,116 @@ namespace esp {
 		const LONG active = InterlockedCompareExchange( &g_world_active_buf, 0, 0 );
 		const int count = g_world_count_buf[ active ];
 		const world_item_t* items = g_world_buf[ active ];
+		if ( count <= 0 ) return;
+
+		// A loot pile is a dozen identical items on one square metre. Drawn one by one
+		// that is a stack of labels on a single point - unreadable, and the outlined
+		// text is the expensive part of this pass. Identical items close together
+		// become one label carrying a count.
+		struct world_group_t {
+			vec3_t world_pos{};
+			vec2_t screen_pos{};
+			float distance = 0.0f;
+			int category = WCAT_LOOSE;
+			int rarity = 0;
+			int num = 1;
+			char label[ 48 ]{};
+		};
+		static world_group_t grp[ 96 ];
+		int n = 0;
 		for ( int i = 0; i < count; ++i ) {
 			const world_item_t& it = items[ i ];
 			if ( !it.valid ) continue;
-			d3d11_ui::color_t c = get_rarity_color( it.rarity );
-			if ( it.category == WCAT_CAR ) c = { config::esp_col.vehicle.r, config::esp_col.vehicle.g, config::esp_col.vehicle.b, 1.0f };
-			else if ( it.category == WCAT_HELI ) c = { config::esp_col.heli.r, config::esp_col.heli.g, config::esp_col.heli.b, 1.0f };
-			else if ( it.category == WCAT_BUYER ) c = { config::esp_col.buyer.r, config::esp_col.buyer.g, config::esp_col.buyer.b, 1.0f };
+			const char* lbl = it.label[ 0 ] ? it.label : "ITEM";
+			int hit = -1;
+			for ( int g = 0; g < n; ++g ) {
+				if ( grp[ g ].category != it.category ) continue;
+				if ( !unity::str_eq( grp[ g ].label, lbl ) ) continue;
+				if ( dist3( grp[ g ].world_pos, it.world_pos ) > 2.5f ) continue;
+				hit = g;
+				break;
+			}
+			if ( hit >= 0 ) {
+				world_group_t& g = grp[ hit ];
+				++g.num;
+				if ( it.distance < g.distance ) {
+					g.distance = it.distance;
+					g.world_pos = it.world_pos;
+					g.screen_pos = it.screen_pos;
+				}
+				continue;
+			}
+			if ( n >= 96 ) continue;
+			world_group_t& g = grp[ n++ ];
+			g.world_pos = it.world_pos;
+			g.screen_pos = it.screen_pos;
+			g.distance = it.distance;
+			g.category = it.category;
+			g.rarity = it.rarity;
+			g.num = 1;
+			copy_str( g.label, sizeof( g.label ), lbl );
+		}
 
-			d3d11_ui::add_filled_circle( it.screen_pos.x, it.screen_pos.y - 8.0f, 3.0f, 8, { 0.0f, 0.0f, 0.0f, 0.85f } );
-			d3d11_ui::add_filled_circle( it.screen_pos.x, it.screen_pos.y - 8.0f, 2.0f, 8, c );
+		// Nearest first: when two labels collide, the near one is the one worth reading.
+		for ( int i = 1; i < n; ++i ) {
+			const world_group_t key = grp[ i ];
+			int j = i - 1;
+			while ( j >= 0 && grp[ j ].distance > key.distance ) {
+				grp[ j + 1 ] = grp[ j ];
+				--j;
+			}
+			grp[ j + 1 ] = key;
+		}
+
+		// Nothing was suppressing label collisions before, so a field of loot drew every
+		// label over every other one. A label that would land on one already drawn is
+		// skipped instead of overprinting it.
+		struct label_box_t { float x0, y0, x1, y1; };
+		static label_box_t taken[ 96 ];
+		int n_taken = 0;
+
+		for ( int i = 0; i < n; ++i ) {
+			const world_group_t& g = grp[ i ];
+			const float sx = g.screen_pos.x;
+			const float sy = g.screen_pos.y;
+			if ( sx < -80.0f || sx > d3d11_ui::g_width + 80.0f || sy < -80.0f || sy > d3d11_ui::g_height + 80.0f ) continue;
+
+			d3d11_ui::color_t c = get_rarity_color( g.rarity );
+			if ( g.category == WCAT_CAR ) c = { config::esp_col.vehicle.r, config::esp_col.vehicle.g, config::esp_col.vehicle.b, 1.0f };
+			else if ( g.category == WCAT_HELI ) c = { config::esp_col.heli.r, config::esp_col.heli.g, config::esp_col.heli.b, 1.0f };
+			else if ( g.category == WCAT_BUYER ) c = { config::esp_col.buyer.r, config::esp_col.buyer.g, config::esp_col.buyer.b, 1.0f };
+
 			char buf[ 80 ]{};
 			char* bend = buf + sizeof( buf ) - 1;
-			char* bp = d3d11_ui::put_str( buf, bend, it.label[ 0 ] ? it.label : "ITEM" );
+			char* bp = d3d11_ui::put_str( buf, bend, g.label );
+			if ( g.num > 1 ) {
+				bp = d3d11_ui::put_str( bp, bend, " x" );
+				bp = d3d11_ui::put_int( bp, bend, g.num );
+			}
 			bp = d3d11_ui::put_char( bp, bend, ' ' );
 			bp = d3d11_ui::put_char( bp, bend, '[' );
-			bp = d3d11_ui::put_int( bp, bend, static_cast< int >( it.distance ) );
+			bp = d3d11_ui::put_int( bp, bend, static_cast< int >( g.distance + 0.5f ) );
 			bp = d3d11_ui::put_char( bp, bend, 'm' );
 			bp = d3d11_ui::put_char( bp, bend, ']' );
 			*bp = '\0';
-			draw_esp_text( it.screen_pos.x, it.screen_pos.y + 4.0f, buf, c, 0.76f );
+
+			const float lw = d3d11_ui::measure_text_width( buf, 0.76f ) * 0.5f;
+			const float tx = sx;
+			const float ty = sy + 4.0f;
+			label_box_t nb{ tx - lw - 1.0f, ty - 5.0f, tx + lw + 1.0f, ty + 5.0f };
+			bool collide = false;
+			for ( int d = 0; d < n_taken; ++d ) {
+				if ( nb.x1 < taken[ d ].x0 || nb.x0 > taken[ d ].x1 ) continue;
+				if ( nb.y1 < taken[ d ].y0 || nb.y0 > taken[ d ].y1 ) continue;
+				collide = true;
+				break;
+			}
+			if ( collide ) continue;
+			if ( n_taken < 96 ) taken[ n_taken++ ] = nb;
+
+			d3d11_ui::add_filled_circle( sx, sy - 8.0f, 3.0f, 8, { 0.0f, 0.0f, 0.0f, 0.85f } );
+			d3d11_ui::add_filled_circle( sx, sy - 8.0f, 2.0f, 8, c );
+			draw_esp_text( tx, ty, buf, c, 0.76f );
 		}
 	}
 

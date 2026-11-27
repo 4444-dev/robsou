@@ -133,6 +133,11 @@ namespace config {
 
 	inline bool world_cars = true;
 	inline bool world_helis = true;
+	inline bool world_cameras = true;
+	inline bool world_doors = true;
+	// Offset of the item price inside the loot descriptor; -1 until the probe has been
+	// read back from the game. While it is -1 no amount is printed on world labels.
+	inline int world_value_off = -1;
 	inline float world_veh_dist = 400.0f;
 	inline bool world_hide_local_veh = true;
 

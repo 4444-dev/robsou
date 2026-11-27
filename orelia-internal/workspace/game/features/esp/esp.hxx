@@ -115,7 +115,8 @@ namespace esp {
 		WCAT_DROPPED   = 5,
 		WCAT_VEH_LOOT  = 6,
 		WCAT_BUYER     = 7,
-		WCAT_DOOR      = 8
+		WCAT_DOOR      = 8,
+		WCAT_CAMERA    = 9
 	};
 
 	struct world_item_t {
@@ -134,6 +135,8 @@ namespace esp {
 		int laundry_eta_s = 0;
 		char owner[ 32 ]{};
 		char label[ 48 ]{};
+		int value = 0;
+		bool locked = false;
 		bool valid = false;
 	};
 
@@ -151,6 +154,8 @@ namespace esp {
 		int laundry_eta_s = 0;
 		char owner[ 32 ]{};
 		char label[ 48 ]{};
+		int value = 0;
+		bool locked = false;
 	};
 
 	struct death_point_t {
@@ -927,6 +932,107 @@ namespace esp {
 		}
 	}
 
+	// The price of an item is not read anywhere in this project yet: which field of the
+	// loot descriptor carries it is unknown for this build, and inventing an offset
+	// would print a wrong amount on every label. The probe reports the positive
+	// per-type constants it finds on the nearest loot, so one look at the panel gives
+	// the offset to wire into config::world_value_off.
+	inline char g_value_probe_id[ 32 ]{};
+	inline int g_value_probe_vals[ 10 ]{};
+	inline int g_value_probe_offs[ 10 ]{};
+	inline int g_value_probe_n = 0;
+
+	inline void fill_value_probe( const char* id, uintptr_t desc ) {
+		g_value_probe_n = 0;
+		copy_str( g_value_probe_id, sizeof( g_value_probe_id ), id );
+		if ( !unity::is_managed_ptr( desc ) ) return;
+		static const int k_offs[ 10 ] = { 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x34, 0x38, 0x40, 0x44 };
+		for ( int i = 0; i < 10; ++i ) {
+			int v = 0;
+			if ( !unity::safe_read( desc + k_offs[ i ], v ) ) continue;
+			if ( v <= 0 || v > 2000000 ) continue;
+			g_value_probe_offs[ g_value_probe_n ] = k_offs[ i ];
+			g_value_probe_vals[ g_value_probe_n ] = v;
+			++g_value_probe_n;
+		}
+	}
+
+	inline bool world_pos_sane( const vec3_t& p ) {
+		if ( !( p.x == p.x ) || !( p.y == p.y ) || !( p.z == p.z ) ) return false;
+		if ( p.y < -300.0f || p.y > 900.0f ) return false;
+		const float d = dist3( p, g_cam_pos );
+		return d > 0.8f && d < 900.0f;
+	}
+
+	// Entity models that carry their transform on a client object (cars, helicopters)
+	// keep the position at client + 0x7C; containers hang theirs on a transform model
+	// reached through the server object. Both known layouts are tried, and a position
+	// that fails a sanity check is rejected instead of drawn at the origin.
+	inline bool entity_world_pos( uintptr_t emodel, vec3_t& out ) {
+		vec3_t p{};
+		const uintptr_t client_m = unity::read_u64( emodel + 0x20 );
+		if ( unity::is_managed_ptr( client_m ) && unity::safe_read( client_m + 0x7C, p ) && world_pos_sane( p ) ) {
+			out = p;
+			return true;
+		}
+		const uintptr_t srv = unity::read_u64( emodel + 0x18 );
+		if ( unity::is_managed_ptr( srv ) ) {
+			const uintptr_t tr_m = unity::read_u64( srv + 0x28 );
+			if ( unity::is_managed_ptr( tr_m ) &&
+				 unity::read_prim_data( unity::read_u64( tr_m + 0x10 ), p.x ) &&
+				 unity::read_prim_data( unity::read_u64( tr_m + 0x18 ), p.y ) &&
+				 unity::read_prim_data( unity::read_u64( tr_m + 0x20 ), p.z ) &&
+				 world_pos_sane( p ) ) {
+				out = p;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	inline uintptr_t battle_phys_data( uintptr_t battle_model ) {
+		if ( !unity::is_managed_ptr( battle_model ) ) return 0;
+		const uintptr_t bem = unity::read_u64( battle_model + 0x90 );
+		if ( !unity::is_managed_ptr( bem ) ) return 0;
+		const uintptr_t phys_scene = unity::read_u64( bem + 0x10 );
+		return unity::is_managed_ptr( phys_scene ) ? unity::read_u64( phys_scene + 0x10 ) : 0;
+	}
+
+	// The flags word of a door body: the same one the door toggle flips, so its bit 8
+	// is what keeps a door shut. Read only, to label the door.
+	inline bool door_first_body_flags( uintptr_t door_m, uintptr_t pdata, int32_t& out_flags ) {
+		if ( !unity::is_managed_ptr( door_m ) || !unity::is_managed_ptr( pdata ) ) return false;
+		const int32_t st_type = unity::read_i32( pdata + 0x30 );
+		const uintptr_t st_bodies = unity::read_u64( pdata + 0x48 );
+		const int32_t dy_type = unity::read_i32( pdata + 0x50 );
+		const uintptr_t dy_bodies = unity::read_u64( pdata + 0x68 );
+		const uintptr_t bodies_m = unity::read_u64( door_m + 0x28 );
+		const uintptr_t body_list = unity::is_managed_ptr( bodies_m ) ? unity::read_u64( bodies_m + 0x10 ) : 0;
+		if ( !unity::is_managed_ptr( body_list ) ) return false;
+		const uintptr_t items = unity::read_u64( body_list + 0x10 );
+		const int32_t sz = unity::read_i32( body_list + 0x18 );
+		if ( !unity::is_managed_ptr( items ) || sz <= 0 || sz > 64 ) return false;
+		const int32_t bval = unity::read_i32( items + 0x20 );
+		const uint8_t btype = unity::read_u8( items + 0x24 );
+		const uintptr_t arr = ( btype == st_type ) ? st_bodies : ( btype == dy_type ? dy_bodies : 0 );
+		if ( !unity::is_managed_ptr( arr ) || bval < 0 ) return false;
+		const int32_t arr_len = unity::read_i32( arr + 0x18 );
+		if ( arr_len <= 0 || bval >= arr_len ) return false;
+		return unity::safe_read( arr + 0x20 + static_cast< size_t >( bval ) * 0xCC, out_flags );
+	}
+
+	inline bool door_flags_for_eid( uintptr_t world_m, uintptr_t pdata, int32_t eid, int32_t& out_flags ) {
+		if ( !unity::is_managed_ptr( world_m ) || !unity::is_managed_ptr( pdata ) || eid < 0 ) return false;
+		uintptr_t entries = 0;
+		const int n = unity::read_dict( unity::read_u64( world_m + 0x48 ), entries );
+		for ( int i = 0; i < n; ++i ) {
+			const uintptr_t ent = entries + static_cast< size_t >( i ) * 0x18;
+			if ( unity::read_i32( ent ) != eid ) continue;
+			return door_first_body_flags( unity::read_u64( ent + 0x10 ), pdata, out_flags );
+		}
+		return false;
+	}
+
 	inline int rarity_from_value( int base_price, int item_rarity ) {
 		if ( base_price > 0 ) {
 			if ( base_price >= 5000 ) return 5;
@@ -985,6 +1091,7 @@ namespace esp {
 
 		g_meta_count = 0;
 		g_world_raw_count = 0;
+		g_value_probe_n = 0;
 
 		if ( !unity::is_managed_ptr( entities_model ) ) {
 			config::model_chain_ok = false;
@@ -1048,7 +1155,7 @@ namespace esp {
 		const int n = unity::read_dict( model_dict, entries );
 		config::diag_models_read = n;
 
-		auto push_world_raw = [&]( int32_t eid, const vec3_t& wpos, int cat, int rarity, bool is_empty, const char* lbl ) {
+		auto push_world_raw = [&]( int32_t eid, const vec3_t& wpos, int cat, int rarity, bool is_empty, const char* lbl, int value = 0, bool locked = false ) {
 			if ( g_world_raw_count >= 256 ) return;
 			world_raw_t& wi = g_world_raw[ g_world_raw_count++ ];
 			wi = {};
@@ -1057,6 +1164,8 @@ namespace esp {
 			wi.category = cat;
 			wi.rarity = rarity;
 			wi.is_empty = is_empty;
+			wi.value = value;
+			wi.locked = locked;
 			copy_str( wi.label, sizeof( wi.label ), lbl );
 		};
 
@@ -1202,25 +1311,45 @@ namespace esp {
 							}
 						}
 					}
-				} else if ( config::world_containers && unity::str_eq( cls, "ContainerEntityModel" ) ) {
+				} else if ( config::world_containers && ( unity::str_icontains( cls, "Container" ) || unity::str_icontains( cls, "Locker" ) ||
+							 unity::str_icontains( cls, "Cabinet" ) || unity::str_icontains( cls, "Storage" ) ) ) {
 					const uintptr_t srv = unity::read_u64( emodel + 0x18 );
 					if ( unity::is_managed_ptr( srv ) ) {
 						uint8_t is_empty = 0;
 						unity::read_prim_model( unity::read_u64( srv + 0x38 ), is_empty );
-						if ( config::world_hide_empty && is_empty ) continue;
+						// An empty cupboard has been opened and emptied: there is nothing left to
+						// walk to, so it leaves the ESP instead of sitting there as an [EMPTY] line.
+						if ( is_empty ) continue;
 						const uintptr_t tr_m = unity::read_u64( srv + 0x28 );
 						if ( unity::is_managed_ptr( tr_m ) ) {
 							vec3_t pos{};
 							if ( unity::read_prim_data( unity::read_u64( tr_m + 0x10 ), pos.x ) &&
 								 unity::read_prim_data( unity::read_u64( tr_m + 0x18 ), pos.y ) &&
 								 unity::read_prim_data( unity::read_u64( tr_m + 0x20 ), pos.z ) ) {
-								push_world_raw( eid, pos, WCAT_CONTAINER, is_empty ? 0 : 3, is_empty != 0, is_empty ? "CONTAINER [EMPTY]" : "CONTAINER [FULL]" );
+								const char* clbl = unity::str_icontains( cls, "Locker" ) ? "LOCKER" :
+												   unity::str_icontains( cls, "Cabinet" ) ? "CABINET" :
+												   unity::str_icontains( cls, "Storage" ) ? "STORAGE" : "CUPBOARD";
+								push_world_raw( eid, pos, WCAT_CONTAINER, 3, false, clbl );
 								if ( dist3( pos, g_cam_pos ) < 55.0f ) {
 									++next_plot.storages;
-									if ( !is_empty ) ++next_plot.full_containers;
+									++next_plot.full_containers;
 								}
 							}
 						}
+					}
+				} else if ( config::world_doors && unity::str_icontains( cls, "Door" ) ) {
+					vec3_t pos{};
+					if ( entity_world_pos( emodel, pos ) ) {
+						const uintptr_t world_m = unity::is_managed_ptr( battle_model ) ? unity::read_u64( battle_model + 0x518 ) : 0;
+						int32_t flags = 0;
+						const bool locked = door_flags_for_eid( world_m, battle_phys_data( battle_model ), eid, flags ) &&
+							( flags & 256 ) != 0;
+						push_world_raw( eid, pos, WCAT_DOOR, locked ? 3 : 1, false, locked ? "DOOR LOCKED" : "DOOR", 0, locked );
+					}
+				} else if ( config::world_cameras && unity::str_icontains( cls, "Camera" ) ) {
+					vec3_t pos{};
+					if ( entity_world_pos( emodel, pos ) ) {
+						push_world_raw( eid, pos, WCAT_CAMERA, 2, false, "CAMERA" );
 					}
 				}
 			}
@@ -1231,6 +1360,7 @@ namespace esp {
 			const uintptr_t world_m = unity::read_u64( battle_model + 0x518 );
 			if ( unity::is_managed_ptr( world_m ) ) {
 				// Loose items (_loots @ 0x38)
+				float probe_best = 1e9f;
 				if ( config::world_loose ) {
 					uintptr_t l_entries = 0;
 					const int ln = unity::read_dict( unity::read_u64( world_m + 0x38 ), l_entries );
@@ -1245,7 +1375,19 @@ namespace esp {
 						if ( unity::safe_read( desc + 0x30, pos ) ) {
 							char raw_id[ 32 ]{};
 							unity::read_enum_id( desc, raw_id, sizeof( raw_id ) );
-							push_world_raw( -1, pos, WCAT_LOOSE, 1, false, raw_id[ 0 ] ? raw_id : "LOOT" );
+							const float pd = dist3( pos, g_cam_pos );
+							if ( pd < probe_best ) {
+								probe_best = pd;
+								fill_value_probe( raw_id, desc );
+							}
+							int value = 0;
+							if ( config::world_value_off > 0 &&
+								 unity::safe_read( desc + config::world_value_off, value ) &&
+								 ( value <= 0 || value > 1000000 ) ) {
+								value = 0;
+							}
+							push_world_raw( -1, pos, WCAT_LOOSE, rarity_from_value( value, 1 ), false,
+											raw_id[ 0 ] ? raw_id : "LOOT", value );
 						}
 					}
 				}
@@ -1371,6 +1513,8 @@ namespace esp {
 			wi.category = raw.category;
 			wi.rarity = raw.rarity;
 			wi.is_empty = raw.is_empty;
+			wi.value = raw.value;
+			wi.locked = raw.locked;
 			pretty_world_label( raw.label, wi.label, sizeof( wi.label ) );
 			wi.valid = true;
 		}
@@ -1407,6 +1551,7 @@ namespace esp {
 		g_aim_rem_y = 0.0f;
 		g_meta_count = 0;
 		g_world_raw_count = 0;
+		g_value_probe_n = 0;
 		g_freecam_active = false;
 		for ( int i = 0; i < 128; ++i ) {
 			g_bone_cache[ i ] = {};
@@ -2310,6 +2455,8 @@ namespace esp {
 			int category = WCAT_LOOSE;
 			int rarity = 0;
 			int num = 1;
+			int value = 0;
+			bool locked = false;
 			char label[ 48 ]{};
 		};
 		static world_group_t grp[ 96 ];
@@ -2333,6 +2480,8 @@ namespace esp {
 					g.distance = it.distance;
 					g.world_pos = it.world_pos;
 					g.screen_pos = it.screen_pos;
+					g.value = it.value;
+					g.locked = it.locked;
 				}
 				continue;
 			}
@@ -2344,6 +2493,8 @@ namespace esp {
 			g.category = it.category;
 			g.rarity = it.rarity;
 			g.num = 1;
+			g.value = it.value;
+			g.locked = it.locked;
 			copy_str( g.label, sizeof( g.label ), lbl );
 		}
 
@@ -2375,6 +2526,8 @@ namespace esp {
 			if ( g.category == WCAT_CAR ) c = { config::esp_col.vehicle.r, config::esp_col.vehicle.g, config::esp_col.vehicle.b, 1.0f };
 			else if ( g.category == WCAT_HELI ) c = { config::esp_col.heli.r, config::esp_col.heli.g, config::esp_col.heli.b, 1.0f };
 			else if ( g.category == WCAT_BUYER ) c = { config::esp_col.buyer.r, config::esp_col.buyer.g, config::esp_col.buyer.b, 1.0f };
+			else if ( g.category == WCAT_CAMERA ) c = { 0.35f, 0.85f, 0.95f, 1.0f };
+			if ( g.locked ) c = { 1.00f, 0.30f, 0.32f, 1.0f };
 
 			char buf[ 80 ]{};
 			char* bend = buf + sizeof( buf ) - 1;
@@ -2388,6 +2541,10 @@ namespace esp {
 			bp = d3d11_ui::put_int( bp, bend, static_cast< int >( g.distance + 0.5f ) );
 			bp = d3d11_ui::put_char( bp, bend, 'm' );
 			bp = d3d11_ui::put_char( bp, bend, ']' );
+			if ( g.value > 0 ) {
+				bp = d3d11_ui::put_char( bp, bend, ' ' );
+				bp = d3d11_ui::put_int( bp, bend, g.value );
+			}
 			*bp = '\0';
 
 			const float lw = d3d11_ui::measure_text_width( buf, 0.76f ) * 0.5f;
@@ -2435,6 +2592,20 @@ namespace esp {
 			}
 			if ( p ) *p = '\0';
 			d3d11_ui::add_text( 18.0f, 120.0f, line, { 0.55f, 1.0f, 0.70f, 0.95f } );
+			if ( g_value_probe_n > 0 ) {
+				char vline[ 128 ]{};
+				char* vend = vline + sizeof( vline ) - 1;
+				char* vp = d3d11_ui::put_str( vline, vend, "VAL " );
+				vp = d3d11_ui::put_str( vp, vend, g_value_probe_id );
+				for ( int i = 0; i < g_value_probe_n && vp < vend - 24; ++i ) {
+					vp = d3d11_ui::put_char( vp, vend, ' ' );
+					vp = d3d11_ui::put_int( vp, vend, g_value_probe_offs[ i ] );
+					vp = d3d11_ui::put_char( vp, vend, '=' );
+					vp = d3d11_ui::put_int( vp, vend, g_value_probe_vals[ i ] );
+				}
+				*vp = '\0';
+				d3d11_ui::add_text( 18.0f, 132.0f, vline, { 0.55f, 1.0f, 0.70f, 0.95f } );
+			}
 		}
 
 		if ( config::aim_master && config::aim_draw_fov ) {

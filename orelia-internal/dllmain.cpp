@@ -323,6 +323,27 @@ namespace dx11_hook {
 		return true;
 	}
 
+	// Validates both candidate bases and picks ours: a readable PE header that is
+	// not the host executable.
+	inline std::uint64_t resolve_self_base( std::uint64_t arg1, std::uint64_t arg3 ) {
+		const std::uint64_t host = reinterpret_cast< std::uint64_t >( GetModuleHandleA( nullptr ) );
+		const std::uint64_t candidates[ 2 ] = { arg1, arg3 };
+		for ( int i = 0; i < 2; ++i ) {
+			const std::uint64_t c = candidates[ i ];
+			if ( !c || c == host ) continue;
+			if ( ( c & 0xFFF ) != 0 ) continue;
+			if ( !unity::is_mem_readable( c, 0x40 ) ) continue;
+			const auto* dos = reinterpret_cast< const IMAGE_DOS_HEADER* >( c );
+			if ( dos->e_magic != IMAGE_DOS_SIGNATURE ) continue;
+			const std::uint64_t nt_addr = c + static_cast< std::uint64_t >( dos->e_lfanew );
+			if ( !unity::is_mem_readable( nt_addr, sizeof( IMAGE_NT_HEADERS64 ) ) ) continue;
+			const auto* nt = reinterpret_cast< const IMAGE_NT_HEADERS64* >( nt_addr );
+			if ( nt->Signature != IMAGE_NT_SIGNATURE ) continue;
+			return c;
+		}
+		return 0;
+	}
+
 	inline void register_seh_pdata( std::uint64_t module_base ) {
 		auto* dos = reinterpret_cast< const IMAGE_DOS_HEADER* >( module_base );
 		if ( !dos || dos->e_magic != IMAGE_DOS_SIGNATURE ) return;
@@ -435,18 +456,43 @@ extern "C" __declspec( dllexport ) void dpc_entry( void*, void* context, void*, 
 	ctx->status = ( ctx->image_base && ctx->image_size ) ? 0u : 2u;
 }
 
+// The two callers disagree on the arguments. reflective_loader calls
+// dllmain( m_dll_base, DLL_PROCESS_ATTACH, host_base ), but the injector's
+// shellcode calls it directly with rcx = host base, rdx = DLL_PROCESS_ATTACH and
+// r8 = our image base. Taking arg1 as our base therefore registered the SEH table
+// of the host executable a second time, which corrupts unwinding for the whole
+// process. Resolve our base from whichever argument actually points at a PE that
+// is not the host module.
 extern "C" __declspec( dllexport ) BOOL APIENTRY DllMain(
 	std::uint64_t module_base,
 	std::uint32_t reason,
 	std::uint64_t reserved
 ) {
-	( void )reserved;
-	if ( reason == DLL_PROCESS_ATTACH ) {
-		if ( !module_base ) return FALSE;
-		dx11_hook::register_seh_pdata( module_base );
-		if ( dx11_hook::wipe_headers ) dx11_hook::wipe_pe_headers( module_base );
-		HANDLE thread = CreateThread( nullptr, 0, &dx11_hook::init_thread, nullptr, 0, nullptr );
-		if ( thread ) CloseHandle( thread );
+	if ( reason != DLL_PROCESS_ATTACH ) return TRUE;
+
+	const std::uint64_t self = dx11_hook::resolve_self_base( module_base, reserved );
+	__try {
+		if ( self ) dx11_hook::register_seh_pdata( self );
+		if ( self && dx11_hook::wipe_headers ) dx11_hook::wipe_pe_headers( self );
 	}
+	__except ( EXCEPTION_EXECUTE_HANDLER ) {
+	}
+
+	// The injector fills g_obs_slot with the graphics-hook64 slot before calling
+	// us, so that path only rewrites a pointer and has to complete before we
+	// return. Without a slot install() would have to create a throwaway D3D11
+	// device, which cannot happen under the loader lock: that is retried on its
+	// own thread instead.
+	if ( ::g_obs_slot.slot_addr && ::g_obs_slot.orig_present ) {
+		__try {
+			dx11_hook::install( );
+		}
+		__except ( EXCEPTION_EXECUTE_HANDLER ) {
+		}
+		return TRUE;
+	}
+
+	HANDLE thread = CreateThread( nullptr, 0, &dx11_hook::init_thread, nullptr, 0, nullptr );
+	if ( thread ) CloseHandle( thread );
 	return TRUE;
 }

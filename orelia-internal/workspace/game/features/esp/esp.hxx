@@ -207,6 +207,7 @@ namespace esp {
 
 	struct bone_cache_t {
 		void* view_obj = nullptr;
+		void* animator = nullptr;
 		void* bone_trs[ k_bone_count ]{};
 		uintptr_t native_bone_trs[ k_bone_count ]{};
 		bool has_bones = false;
@@ -291,6 +292,36 @@ namespace esp {
 		return !behind;
 	}
 
+	// The animator does not sit at a fixed offset inside every character view, and
+	// the previous path (view+0x28 -> +0x20) was two guesses. It is tried first,
+	// then the view's own reference fields are scanned for an instance whose class
+	// is exactly Animator: the name check means a wrong pointer can never be handed
+	// to GetBoneTransform.
+	inline void* find_animator( void* view_obj ) {
+		if ( !unity::is_valid_obj( view_obj ) ) return nullptr;
+		const uintptr_t v = reinterpret_cast< uintptr_t >( view_obj );
+
+		if ( unity::is_mem_readable( v + 0x28, sizeof( uintptr_t ) ) ) {
+			const uintptr_t anim_view = unity::read_u64( v + 0x28 );
+			if ( unity::is_managed_ptr( anim_view ) ) {
+				if ( unity::obj_is( anim_view, "Animator" ) ) return reinterpret_cast< void* >( anim_view );
+				if ( unity::is_mem_readable( anim_view + 0x20, sizeof( uintptr_t ) ) ) {
+					const uintptr_t nested = unity::read_u64( anim_view + 0x20 );
+					if ( unity::is_valid_obj( reinterpret_cast< void* >( nested ) ) && unity::obj_is( nested, "Animator" ) )
+						return reinterpret_cast< void* >( nested );
+				}
+			}
+		}
+
+		for ( uintptr_t off = 0x10; off < 0x400; off += sizeof( uintptr_t ) ) {
+			if ( !unity::is_mem_readable( v + off, sizeof( uintptr_t ) ) ) break;
+			const uintptr_t field = unity::read_u64( v + off );
+			if ( !unity::is_managed_ptr( field ) ) continue;
+			if ( unity::obj_is( field, "Animator" ) ) return reinterpret_cast< void* >( field );
+		}
+		return nullptr;
+	}
+
 	inline const bone_cache_t* get_or_resolve_bones( void* view_obj, ULONGLONG now, int& budget ) {
 		if ( !view_obj ) return nullptr;
 		int slot = -1;
@@ -318,9 +349,13 @@ namespace esp {
 		bc.last_try = now;
 		bc.has_bones = false;
 
+		if ( !bc.animator || !unity::is_valid_obj( bc.animator ) ) {
+			bc.animator = find_animator( view_obj );
+		}
+
 		const uintptr_t anim_view = unity::read_u64( reinterpret_cast< uintptr_t >( view_obj ) + 0x28 );
 		if ( unity::is_managed_ptr( anim_view ) ) {
-			void* animator = reinterpret_cast< void* >( unity::read_u64( anim_view + 0x20 ) );
+			void* animator = bc.animator;
 			if ( unity::is_valid_obj( animator ) && unity::fn_anim_get_bone ) {
 				int valid_cnt = 0;
 				for ( int b = 0; b < k_bone_count; ++b ) {

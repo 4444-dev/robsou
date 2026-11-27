@@ -1856,6 +1856,116 @@ namespace esp {
 			++next_count;
 		}
 
+		// A player who sits down in a vehicle loses their character view: it stops
+		// being returned by FindObjectsOfType, so the box, the name and everything
+		// else vanished while they were driving. The entity model is still streamed
+		// and still tracks them, so those players are built from the metadata, and
+		// they take part in target selection like everybody else.
+		for ( int i = 0; i < g_meta_count && next_count < 256; ++i ) {
+			const meta_entry_t& m = g_meta[ i ];
+			if ( !m.valid || m.is_local || m.entity_id < 0 ) continue;
+
+			bool seen = false;
+			for ( int j = 0; j < next_count; ++j ) {
+				if ( dst[ j ].entity_id > 0 && dst[ j ].entity_id == m.entity_id ) {
+					seen = true;
+					break;
+				}
+				if ( dst[ j ].entity_id <= 0 && dist3( dst[ j ].root_world, m.pos ) < 1.5f ) {
+					seen = true;
+					break;
+				}
+			}
+			if ( seen ) continue;
+
+			const vec3_t pos = m.pos;
+			const float dist = dist3( pos, g_cam_pos );
+			// A seated body is shorter than a standing one: a standing-sized box on a
+			// driver reads as a player standing on the roof.
+			const float hh = m.in_vehicle ? 1.42f : 1.58f;
+			const float th = m.in_vehicle ? 1.58f : 1.75f;
+			const vec3_t head_w{ pos.x, pos.y + hh, pos.z };
+			const vec3_t top_w{ pos.x, pos.y + th, pos.z };
+
+			vec2_t hs{}, rs{};
+			bool behind_h = false, behind_r = false;
+			if ( !w2s_vp( top_w, hs, behind_h ) ) continue;
+			if ( !w2s_vp( pos, rs, behind_r ) ) continue;
+
+			player_t& out = dst[ next_count ];
+			out = {};
+			out.obj = nullptr;
+			out.root_world = pos;
+			out.head_world = head_w;
+			out.neck_world = { head_w.x, pos.y + hh * 0.88f, head_w.z };
+			out.chest_world = { pos.x, pos.y + hh * 0.70f, pos.z };
+			out.pelvis_world = { pos.x, pos.y + hh * 0.50f, pos.z };
+			out.head_screen = hs;
+			out.root_screen = rs;
+			out.distance = dist;
+			out.health = 1.0f;
+			out.on_screen = !behind_h && !behind_r &&
+				hs.x >= -100.0f && hs.x <= d3d11_ui::g_width + 100.0f &&
+				hs.y >= -100.0f && hs.y <= d3d11_ui::g_height + 100.0f;
+			out.behind = behind_h || behind_r;
+			out.valid = true;
+			out.entity_id = m.entity_id;
+			out.vehicle_eid = m.vehicle_eid;
+			out.role_kind = m.role_kind;
+			out.is_team = ( m.role_kind == ROLE_TEAM );
+			out.is_friend = config::is_friend( m.entity_id );
+			out.has_shield = m.has_armor;
+			out.shield_value = m.has_armor ? 1.0f : 0.0f;
+			out.in_vehicle = m.in_vehicle;
+			out.is_knocked = m.is_knocked;
+			out.is_dead = m.is_dead;
+			out.look_dir = m.look_dir;
+			copy_str( out.name, sizeof( out.name ), m.name );
+			copy_str( out.tag, sizeof( out.tag ), m.tag );
+			copy_str( out.clan, sizeof( out.clan ), m.clan );
+			copy_str( out.weapon, sizeof( out.weapon ), m.weapon );
+
+			if ( out.on_screen ) {
+				vec2_t ns{}, cs{}, ps{};
+				world_to_screen( out.neck_world, ns );
+				world_to_screen( out.chest_world, cs );
+				world_to_screen( out.pelvis_world, ps );
+				out.neck_screen = ns;
+				out.chest_screen = cs;
+				out.pelvis_screen = ps;
+			}
+
+			const bool skip_clan = ( config::aim_ignore_clan && g_local_clan[ 0 ] && out.clan[ 0 ] && unity::str_eq( g_local_clan, out.clan ) );
+			const bool skip_police = ( config::aim_ignore_police && out.role_kind == ROLE_COP );
+			const bool skip_knocked = ( config::aim_ignore_knocked && out.is_knocked );
+			const bool skip_friend = ( config::aim_ignore_friends && out.is_friend );
+			if ( config::aim_master && out.on_screen && dist <= eff_aim_dist &&
+				 !skip_clan && !skip_police && !skip_knocked && !skip_friend && !out.is_dead &&
+				 ( !config::aim_vis_check || !unity::unity_linecast( g_cam_pos, out.head_world ) ) ) {
+				const vec3_t aim_w = select_aim_point( out, cx, cy, true );
+				vec2_t aim_s{};
+				if ( world_to_screen( aim_w, aim_s ) ) {
+					const float adx = aim_s.x - cx;
+					const float ady = aim_s.y - cy;
+					const float fov_d = d3d11_ui::fast_sqrt( adx * adx + ady * ady );
+					const float score = config::aim_closest_first ? dist : fov_d;
+					if ( fov_d <= config::aim_fov && score < best_score ) {
+						best_score = score;
+						best_aim_idx = next_count;
+						best_aim_world = aim_w;
+						best_aim_screen = aim_s;
+					}
+					if ( config::aim_mode == 2 && fov_d <= best_silent_fov ) {
+						best_silent_fov = fov_d;
+						best_silent_idx = next_count;
+						best_silent_screen = aim_s;
+					}
+				}
+			}
+
+			++next_count;
+		}
+
 		g_player_count_buf[ back ] = next_count;
 		InterlockedExchange( &g_active_buf, back );
 		config::diag_players_tracked = next_count;

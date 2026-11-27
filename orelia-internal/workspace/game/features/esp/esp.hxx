@@ -1629,11 +1629,21 @@ namespace esp {
 						out.has_real_skeleton = ( ok_cnt >= 6 );
 
 						out.skel_edge_count = 0;
+						float lo_y = 1e9f;
+						float hi_y = -1e9f;
 						if ( bc->edge_count > 0 ) {
 							for ( int n2 = 0; n2 < bc->node_count; ++n2 ) {
 								vec3_t np{};
-								out.skel_p_ok[ n2 ] = unity::get_transform_pos( bc->nodes[ n2 ], np ) &&
-									world_to_screen( np, out.skel_p[ n2 ] );
+								const bool got = unity::get_transform_pos( bc->nodes[ n2 ], np );
+								out.skel_p_ok[ n2 ] = got && world_to_screen( np, out.skel_p[ n2 ] );
+								if ( !got ) continue;
+								// Only nodes that belong to this body feed the vertical extent.
+								const float ndy = np.y - pos.y;
+								const float ndx = np.x - pos.x;
+								const float ndz = np.z - pos.z;
+								if ( ndy < -0.60f || ndy > 2.40f || ( ndx * ndx + ndz * ndz ) > 1.69f ) continue;
+								if ( np.y < lo_y ) lo_y = np.y;
+								if ( np.y > hi_y ) hi_y = np.y;
 							}
 							for ( int e = 0; e < bc->edge_count; ++e ) {
 								const int ia = bc->ea[ e ];
@@ -1642,6 +1652,29 @@ namespace esp {
 								out.skel_ea[ out.skel_edge_count ] = static_cast< unsigned char >( ia );
 								out.skel_eb[ out.skel_edge_count ] = static_cast< unsigned char >( ib );
 								++out.skel_edge_count;
+							}
+
+							// The box and the body points follow the bones, not the head alone.
+							// Crouching, sitting or lying down lowers the head without moving the
+							// entity origin, which is what made the box read as "head glued to the
+							// character, rest of the box left standing". The span gate keeps a
+							// partially resolved skeleton from shrinking the box onto the torso.
+							if ( hi_y - lo_y >= 0.85f && hi_y - lo_y <= 2.60f ) {
+								const float span = hi_y - lo_y;
+								out.head_world = { out.head_world.x, hi_y, out.head_world.z };
+								out.root_world = { out.root_world.x, lo_y, out.root_world.z };
+								vec2_t top_s{}, bot_s{};
+								if ( world_to_screen( { out.head_world.x, hi_y + 0.16f, out.head_world.z }, top_s ) ) out.head_screen = top_s;
+								if ( world_to_screen( { out.root_world.x, lo_y, out.root_world.z }, bot_s ) ) out.root_screen = bot_s;
+								out.neck_world = { out.head_world.x, lo_y + span * 0.88f, out.head_world.z };
+								out.chest_world = { out.root_world.x, lo_y + span * 0.70f, out.root_world.z };
+								out.pelvis_world = { out.root_world.x, lo_y + span * 0.50f, out.root_world.z };
+								world_to_screen( out.neck_world, ns );
+								world_to_screen( out.chest_world, cs );
+								world_to_screen( out.pelvis_world, ps );
+								out.neck_screen = ns;
+								out.chest_screen = cs;
+								out.pelvis_screen = ps;
 							}
 						}
 					}

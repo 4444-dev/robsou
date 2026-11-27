@@ -345,9 +345,31 @@ namespace esp {
 		++bc.edge_count;
 	}
 
-	// Real children of a transform, depth limited. Only links between 2 cm and
-	// 75 cm are kept: that covers every human bone and rejects props attached to a
-	// bone, which is what used to draw lines away from the body.
+	// A real bone continues into another bone. Hair, cloth, straps and props hang
+	// off a bone as leaves, and they are what put short stray segments across the
+	// chest. Above the last two levels, a child with nothing hanging under it is
+	// therefore not a bone. The last levels are kept as leaves because hands and
+	// feet have no children.
+	inline bool skel_continues( void* tr, const vec3_t& tp ) {
+		const int count = unity::tr_child_count( tr );
+		for ( int i = 0; i < count && i < 8; ++i ) {
+			void* child = unity::tr_get_child( tr, i );
+			if ( !child ) continue;
+			vec3_t cp{};
+			if ( !unity::get_transform_pos( child, cp ) ) continue;
+			const float dx = cp.x - tp.x;
+			const float dy = cp.y - tp.y;
+			const float dz = cp.z - tp.z;
+			const float d2 = dx * dx + dy * dy + dz * dz;
+			if ( d2 >= 0.0004f && d2 <= 0.2025f ) return true;
+		}
+		return false;
+	}
+
+	// Real children of a transform, depth limited. Only links shorter than 45 cm
+	// are kept: every human bone fits under that, while a link that jumps from one
+	// side of the body to the other - the long diagonal that crossed the legs -
+	// does not.
 	inline void walk_skel_children( bone_cache_t& bc, void* parent, const vec3_t& pp, int depth ) {
 		if ( depth <= 0 || bc.edge_count >= k_skel_max_nodes ) return;
 		const int count = unity::tr_child_count( parent );
@@ -361,7 +383,8 @@ namespace esp {
 			const float dy = cp.y - pp.y;
 			const float dz = cp.z - pp.z;
 			const float d2 = dx * dx + dy * dy + dz * dz;
-			if ( d2 < 0.0004f || d2 > 0.5625f ) continue;
+			if ( d2 < 0.0004f || d2 > 0.2025f ) continue;
+			if ( depth > 2 && !skel_continues( child, cp ) ) continue;
 			add_skel_edge( bc, parent, child );
 			const int idx = skel_index( bc, child );
 			if ( idx >= 0 ) {
@@ -503,9 +526,8 @@ namespace esp {
 					if ( bc.edge_count >= k_skel_max_nodes ) break;
 					walk_skel_children( bc, chain[ i ], chain_pos[ i ], 4 );
 				}
-				if ( bc.edge_count < k_skel_max_nodes ) {
-					walk_skel_children( bc, chain[ 0 ], chain_pos[ 0 ], 2 );
-				}
+				// The head is not expanded: its circle is drawn explicitly, and its
+				// children are a jaw, eyes and hair, none of which is a bone worth a line.
 			}
 		}
 		if ( bc.edge_count >= 4 ) {

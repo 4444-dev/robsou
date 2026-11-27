@@ -55,8 +55,15 @@ namespace dx11_hook {
 	}
 
 	inline void hk_late_update( void* self, void* method ) {
+		// The original call is guarded too: when the scene is rebuilt on death the
+		// camera object can be halfway through its teardown, and an exception in the
+		// game's own LateUpdate took the whole process with it.
 		if ( o_late_update ) {
-			o_late_update( self, method );
+			__try {
+				o_late_update( self, method );
+			}
+			__except ( EXCEPTION_EXECUTE_HANDLER ) {
+			}
 		}
 		__try {
 			esp::g_last_late_update_tick = GetTickCount64( );
@@ -73,6 +80,10 @@ namespace dx11_hook {
 						}
 						__except ( EXCEPTION_EXECUTE_HANDLER ) {
 							InterlockedIncrement( &config::diag_seh_faults );
+							// A fault means a cached pointer was stale: drop every cache so
+							// the next frame starts from the live models instead of
+							// faulting again on the same address.
+							InterlockedExchange( &esp::g_force_reset, 1 );
 							s_last_fault_tick = now;
 						}
 					}

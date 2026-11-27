@@ -59,6 +59,9 @@ namespace esp {
 		// not depend on an Animator, on a humanoid rig or on any field offset, so it
 		// is the path that actually attaches to the player.
 		vec2_t skel_p[ 64 ]{};
+		// World position of every hierarchy node, kept so the draw path can reject
+		// a link that is not one bone long (a strap, a prop, a stale transform).
+		vec3_t skel_pw[ 64 ]{};
 		bool skel_p_ok[ 64 ]{};
 		unsigned char skel_ea[ 64 ]{};
 		unsigned char skel_eb[ 64 ]{};
@@ -249,6 +252,20 @@ namespace esp {
 	inline float g_aim_rem_y = 0.0f;
 	inline bool g_is_firing_or_aiming = false;
 	inline volatile ULONGLONG g_last_late_update_tick = 0;
+
+	// Scene identity. On death and on respawn the game destroys the battle models
+	// and rebuilds them, so every pointer cached against the old scene (bone
+	// cache, aim models, weapon chain) points into freed memory. A write through
+	// one of those is heap corruption, and the rebuild is exactly when the GC
+	// notices it - which is what "it crashes when I die" is.
+	inline uintptr_t g_scene_battle = 0;
+	inline uintptr_t g_scene_entities = 0;
+	inline uintptr_t g_scene_local_ent = 0;
+	inline uintptr_t g_local_char_model = 0;
+	inline bool g_local_dead = false;
+	// Set from the hook when a fault was swallowed: a fault means some pointer
+	// was stale, so every cache built against it is dropped on the next frame.
+	inline volatile LONG g_force_reset = 0;
 
 	// Free cam & FOV state
 	inline bool g_freecam_active = false;
@@ -623,7 +640,10 @@ namespace esp {
 	inline bool apply_direct_3d_aim( uintptr_t battle_model, const vec3_t& target_w ) {
 		if ( !unity::is_managed_ptr( battle_model ) ) return false;
 		const uintptr_t rot_input = unity::read_u64( battle_model + 0x40 ); // PlayerRotationInputModel
-		if ( !unity::is_managed_ptr( rot_input ) ) return false;
+		// The field is checked against the class name the dump gives, so a build
+		// where it holds something else cannot be written into by mistake.
+		if ( !unity::is_managed_ptr( rot_input ) || !unity::obj_is( rot_input, "PlayerRotationInputModel" ) )
+			return false;
 
 		float cur_yaw = 0.0f, cur_pitch = 0.0f;
 		if ( !unity::safe_read( rot_input + 0x10, cur_yaw ) || !unity::safe_read( rot_input + 0x14, cur_pitch ) )
@@ -685,84 +705,246 @@ namespace esp {
 		return true;
 	}
 
-	// The aim-target model was taken from a fixed field and used blind. If that
-	// field holds something else - a different build, a different model layout -
-	// the write lands in an unrelated object and silently does nothing, which is
-	// exactly what "silent aim does not work" looks like. It is now identified by
-	// class name, with the known field tried first and a bounded scan after it.
-	inline uintptr_t find_aim_model( uintptr_t battle_model ) {
-		static uintptr_t s_battle = 0;
-		static uintptr_t s_model = 0;
-		if ( battle_model == s_battle && s_model &&
-			 unity::is_valid_obj( reinterpret_cast< void* >( s_model ) ) ) {
-			return s_model;
-		}
-		s_battle = battle_model;
-		s_model = 0;
-		if ( !unity::is_valid_obj( reinterpret_cast< void* >( battle_model ) ) ) return 0;
+	// ---- Model lookup by class name ------------------------------------------
+	// The old silent aim took any object whose class name merely contained
+	// "AimTarget" and wrote an entity id into its first two ints. Views, colour
+	// descriptions and look-alike assets all match that test, so the write landed
+	// in an unrelated object: the shot never moved, and the managed heap was
+	// corrupted - which is what crashed the game when the scene was rebuilt on
+	// death. Every model written here is now found by exact class name, cached
+	// with its klass pointer, and checked again right before the write: an object
+	// whose klass changed is a reused address and is dropped, never written to.
+	struct model_slot_t {
+		uintptr_t root = 0;
+		uintptr_t obj = 0;
+		uintptr_t klass = 0;
+		ULONGLONG tick = 0;
+	};
 
-		const uintptr_t direct = unity::read_u64( battle_model + 0x198 );
-		if ( unity::is_valid_obj( reinterpret_cast< void* >( direct ) ) && unity::obj_contains( direct, "AimTarget" ) ) {
-			s_model = direct;
-			unity::get_class_name( direct, config::diag_aim_class, sizeof( config::diag_aim_class ) );
-			return direct;
-		}
-		for ( uintptr_t off = 0x10; off <= 0x400; off += sizeof( void* ) ) {
-			const uintptr_t field = unity::read_u64( battle_model + off );
-			if ( !unity::is_valid_obj( reinterpret_cast< void* >( field ) ) ) continue;
-			if ( unity::obj_contains( field, "AimTarget" ) ) {
-				s_model = field;
-				unity::get_class_name( field, config::diag_aim_class, sizeof( config::diag_aim_class ) );
-				return field;
-			}
+	inline bool model_alive( const model_slot_t& s, const char* cls ) {
+		if ( !s.obj || !unity::is_managed_ptr( s.obj ) ) return false;
+		if ( unity::read_u64( s.obj ) != s.klass ) return false;
+		char nm[ 64 ]{};
+		if ( !unity::get_class_name( s.obj, nm, sizeof( nm ) ) ) return false;
+		return unity::str_eq( nm, cls );
+	}
+
+	inline uintptr_t find_class_field( uintptr_t root, const char* cls ) {
+		if ( !unity::is_managed_ptr( root ) ) return 0;
+		for ( uintptr_t off = 0x10; off <= 0x900; off += sizeof( uintptr_t ) ) {
+			if ( !unity::is_mem_readable( root + off, sizeof( uintptr_t ) ) ) break;
+			const uintptr_t v = unity::read_u64( root + off );
+			if ( !unity::is_managed_ptr( v ) ) continue;
+			char nm[ 64 ]{};
+			if ( !unity::get_class_name( v, nm, sizeof( nm ) ) ) continue;
+			if ( unity::str_eq( nm, cls ) ) return v;
 		}
 		return 0;
 	}
 
-	// Silent aim redirects the shot without moving the camera: the game reads its
-	// aim-target model when the shot resolves, so the entity id is written there
-	// while the trigger is held and the previous values are restored on release.
-	// Holding it permanently was wrong twice: the game clears the field between
-	// shots, and a field that never returns to its own value is what a server sees.
-	inline void apply_silent_target( uintptr_t battle_model, int32_t eid, bool active ) {
-		static uintptr_t s_model = 0;
-		static int32_t s_orig_id = 0;
-		static int32_t s_orig_type = 0;
-		static bool s_saved = false;
-		static bool s_written = false;
+	// A failed scan is retried at most every two seconds: walking ~280 fields per
+	// root on every frame is exactly the sort of cost that shows up as a drop.
+	inline uintptr_t ensure_model( model_slot_t& s, uintptr_t root, const char* cls, ULONGLONG now ) {
+		if ( s.obj && s.root == root && model_alive( s, cls ) ) return s.obj;
+		if ( s.obj || s.root != root ) {
+			s.obj = 0;
+			s.klass = 0;
+			s.root = root;
+		}
+		if ( s.tick != 0 && ( now - s.tick ) < 2000 ) return 0;
+		s.tick = now;
+		const uintptr_t obj = find_class_field( root, cls );
+		if ( !obj ) return 0;
+		s.obj = obj;
+		s.klass = unity::read_u64( obj );
+		return obj;
+	}
 
-		if ( !active || eid <= 0 ) {
-			if ( s_written && s_saved && s_model ) {
-				unity::safe_write< int32_t >( s_model + 0x10, s_orig_id );
-				unity::safe_write< int32_t >( s_model + 0x14, s_orig_type );
+	inline model_slot_t g_aim_target_slot{};
+	inline model_slot_t g_rot_input_slot{};
+	inline model_slot_t g_look_dir_slot{};
+
+	struct silent_state_t {
+		uintptr_t model = 0;
+		uintptr_t klass = 0;
+		int32_t orig_eid = 0;
+		int32_t orig_type = 0;
+		bool saved = false;
+		bool written = false;
+	};
+	inline silent_state_t g_silent_aim{};
+
+	inline uintptr_t g_silent_look = 0;
+	inline uintptr_t g_silent_look_klass = 0;
+	inline vec3_t g_silent_look_value{};
+	inline float g_silent_look_yaw = 0.0f;
+	inline float g_silent_look_pitch = 0.0f;
+	inline bool g_silent_look_saved = false;
+
+	inline uintptr_t g_silent_rot = 0;
+	inline uintptr_t g_silent_rot_klass = 0;
+	inline float g_silent_rot_yaw = 0.0f;
+	inline float g_silent_rot_pitch = 0.0f;
+	inline bool g_silent_rot_saved = false;
+
+	inline int g_silent_pulse_frames = 0;
+	inline ULONGLONG g_silent_last_pulse = 0;
+	inline bool g_silent_prev_fire = false;
+
+	inline void forget_models( ) {
+		g_aim_target_slot = {};
+		g_rot_input_slot = {};
+		g_look_dir_slot = {};
+	}
+
+	// Restoring is the dangerous half: it runs on paths where the scene may have
+	// been torn down between the save and the restore, so each model is checked
+	// for its klass and its class name again before anything is written back.
+	inline void silent_release( ) {
+		if ( g_silent_aim.written && g_silent_aim.model &&
+			 unity::is_managed_ptr( g_silent_aim.model ) &&
+			 unity::read_u64( g_silent_aim.model ) == g_silent_aim.klass &&
+			 unity::obj_is( g_silent_aim.model, "AimTargetModel" ) ) {
+			unity::safe_write< int32_t >( g_silent_aim.model + 0x10, g_silent_aim.orig_eid );
+			unity::safe_write< int32_t >( g_silent_aim.model + 0x14, g_silent_aim.orig_type );
+		}
+		g_silent_aim = {};
+
+		if ( g_silent_look_saved && g_silent_look && unity::is_managed_ptr( g_silent_look ) &&
+			 unity::read_u64( g_silent_look ) == g_silent_look_klass &&
+			 unity::obj_is( g_silent_look, "LookDirectionModel" ) ) {
+			unity::safe_write< vec3_t >( g_silent_look + 0x10, g_silent_look_value );
+			unity::safe_write< float >( g_silent_look + 0x1C, g_silent_look_yaw );
+			unity::safe_write< float >( g_silent_look + 0x20, g_silent_look_pitch );
+		}
+		g_silent_look_saved = false;
+		g_silent_look = 0;
+
+		if ( g_silent_rot_saved && g_silent_rot && unity::is_managed_ptr( g_silent_rot ) &&
+			 unity::read_u64( g_silent_rot ) == g_silent_rot_klass &&
+			 unity::obj_is( g_silent_rot, "PlayerRotationInputModel" ) ) {
+			unity::safe_write< float >( g_silent_rot + 0x10, g_silent_rot_yaw );
+			unity::safe_write< float >( g_silent_rot + 0x14, g_silent_rot_pitch );
+		}
+		g_silent_rot_saved = false;
+		g_silent_rot = 0;
+
+		g_silent_pulse_frames = 0;
+		config::diag_silent_eid = -1;
+	}
+
+	// One pulse. The direction the shot is resolved from is set for this frame and
+	// restored on the next one, so the camera - which follows the look direction
+	// with its own smoothing - barely moves while the bullet leaves along the
+	// target vector. The offsets come from the dump:
+	//   LookDirectionModel        0x10 Vector3 _value, 0x1C float _yaw, 0x20 float _pitch
+	//   PlayerRotationInputModel  0x10 yaw, 0x14 pitch
+	//   AimTargetModel            entity id 0x10, type 0x14 (Type.BattleCharacter = 3)
+	// The aim-target write is read back, so the diagnostic only reports a target
+	// that was really set instead of one that was merely attempted.
+	inline void silent_begin( uintptr_t battle_model, uintptr_t char_model, int32_t eid, const vec3_t& target, ULONGLONG now ) {
+		const float dx = target.x - g_cam_pos.x;
+		const float dy = target.y - g_cam_pos.y;
+		const float dz = target.z - g_cam_pos.z;
+		const float horiz = d3d11_ui::fast_sqrt( dx * dx + dz * dz );
+		if ( !( horiz == horiz ) || horiz < 0.05f ) return;
+
+		constexpr float k_rad2deg = 57.2957795f;
+		constexpr float k_deg2rad = 0.0174532925f;
+		const float yaw_deg = static_cast< float >( std::atan2( dx, dz ) ) * k_rad2deg;
+		const float pitch_deg = -static_cast< float >( std::atan2( dy, horiz ) ) * k_rad2deg;
+
+		const uintptr_t look = ensure_model( g_look_dir_slot, char_model ? char_model : battle_model, "LookDirectionModel", now );
+		if ( look ) {
+			if ( !g_silent_look_saved ) {
+				g_silent_look = look;
+				g_silent_look_klass = g_look_dir_slot.klass;
+				unity::safe_read( look + 0x10, g_silent_look_value );
+				unity::safe_read( look + 0x1C, g_silent_look_yaw );
+				unity::safe_read( look + 0x20, g_silent_look_pitch );
+				g_silent_look_saved = true;
 			}
-			s_written = false;
-			config::diag_silent_eid = -1;
+			const float cp = static_cast< float >( std::cos( pitch_deg * k_deg2rad ) );
+			const vec3_t dir{
+				static_cast< float >( std::sin( yaw_deg * k_deg2rad ) ) * cp,
+				-static_cast< float >( std::sin( pitch_deg * k_deg2rad ) ),
+				static_cast< float >( std::cos( yaw_deg * k_deg2rad ) ) * cp
+			};
+			unity::safe_write< vec3_t >( look + 0x10, dir );
+			unity::safe_write< float >( look + 0x1C, yaw_deg );
+			unity::safe_write< float >( look + 0x20, pitch_deg );
+		}
+
+		const uintptr_t rot = ensure_model( g_rot_input_slot, battle_model, "PlayerRotationInputModel", now );
+		if ( rot ) {
+			if ( !g_silent_rot_saved ) {
+				g_silent_rot = rot;
+				g_silent_rot_klass = g_rot_input_slot.klass;
+				unity::safe_read( rot + 0x10, g_silent_rot_yaw );
+				unity::safe_read( rot + 0x14, g_silent_rot_pitch );
+				g_silent_rot_saved = true;
+			}
+			unity::safe_write< float >( rot + 0x10, yaw_deg );
+			unity::safe_write< float >( rot + 0x14, pitch_deg );
+		}
+
+		const uintptr_t atm = ensure_model( g_aim_target_slot, battle_model, "AimTargetModel", now );
+		if ( atm ) {
+			if ( !g_silent_aim.saved ) {
+				int32_t oid = 0, otype = 0;
+				if ( unity::safe_read< int32_t >( atm + 0x10, oid ) && unity::safe_read< int32_t >( atm + 0x14, otype ) ) {
+					g_silent_aim.model = atm;
+					g_silent_aim.klass = g_aim_target_slot.klass;
+					g_silent_aim.orig_eid = oid;
+					g_silent_aim.orig_type = otype;
+					g_silent_aim.saved = true;
+				}
+			}
+			if ( g_silent_aim.saved && unity::safe_write< int32_t >( atm + 0x10, eid ) ) {
+				unity::safe_write< int32_t >( atm + 0x14, 3 );
+				int32_t back = 0;
+				if ( unity::safe_read< int32_t >( atm + 0x10, back ) && back == eid ) {
+					g_silent_aim.written = true;
+					config::diag_silent_eid = eid;
+				}
+			}
+		}
+
+		// Which levers actually resolved, in the diagnostic line: AT = aim target
+		// model, LOOK = look direction model, ROT = rotation input model.
+		{
+			char ds[ 48 ]{};
+			char* dp = ds;
+			char* de = ds + sizeof( ds ) - 1;
+			if ( atm ) dp = d3d11_ui::put_str( dp, de, "AT " );
+			if ( look ) dp = d3d11_ui::put_str( dp, de, "LOOK " );
+			if ( rot ) dp = d3d11_ui::put_str( dp, de, "ROT" );
+			if ( dp == ds ) dp = d3d11_ui::put_str( dp, de, "no model" );
+			*dp = '\0';
+			copy_str( config::diag_aim_class, sizeof( config::diag_aim_class ), ds );
+		}
+	}
+
+	inline void silent_aim_update( uintptr_t battle_model, uintptr_t char_model, bool firing, int32_t eid,
+								   const vec3_t& target, ULONGLONG now ) {
+		const bool fire = firing && eid > 0 && !g_local_dead;
+		const bool edge = fire && !g_silent_prev_fire;
+		g_silent_prev_fire = fire;
+		if ( !fire ) {
+			silent_release( );
 			return;
 		}
-
-		const uintptr_t model = find_aim_model( battle_model );
-		if ( !model ) return;
-
-		if ( model != s_model ) {
-			s_model = model;
-			s_saved = false;
-			s_written = false;
+		if ( g_silent_pulse_frames > 0 ) {
+			if ( --g_silent_pulse_frames == 0 ) silent_release( );
+			return;
 		}
-		if ( !s_saved ) {
-			int32_t orig_id = 0;
-			int32_t orig_type = 0;
-			if ( !unity::safe_read< int32_t >( model + 0x10, orig_id ) ) return;
-			if ( !unity::safe_read< int32_t >( model + 0x14, orig_type ) ) return;
-			s_orig_id = orig_id;
-			s_orig_type = orig_type;
-			s_saved = true;
+		// A held trigger fires again at the weapon cadence, so the direction is
+		// re-aimed every ~70 ms while the button stays down.
+		if ( edge || ( now - g_silent_last_pulse ) >= 70 ) {
+			silent_begin( battle_model, char_model, eid, target, now );
+			g_silent_pulse_frames = 2;
+			g_silent_last_pulse = now;
 		}
-
-		unity::safe_write< int32_t >( model + 0x10, eid );
-		unity::safe_write< int32_t >( model + 0x14, 3 ); // 3 = character
-		s_written = true;
-		config::diag_silent_eid = eid;
 	}
 
 	inline int classify_role( const char* role_id, char* out_tag, size_t tag_cap ) {
@@ -811,7 +993,9 @@ namespace esp {
 		if ( unity::is_managed_ptr( client_m ) ) {
 			if ( config::no_recoil || config::rcs_enabled ) {
 				const uintptr_t recoil_m = unity::read_u64( client_m + 0x2B8 );
-				if ( unity::is_managed_ptr( recoil_m ) ) {
+				// The class name is checked before the write: a build where this field
+				// holds something else must not have two floats overwritten in it.
+				if ( unity::is_managed_ptr( recoil_m ) && unity::obj_contains( recoil_m, "Recoil" ) ) {
 					const float scale = config::no_recoil ? 0.0f : ( 1.0f - d3d11_ui::clampf( config::rcs_strength, 0.0f, 1.0f ) );
 					float rx = 0.0f, ry = 0.0f;
 					if ( unity::safe_read( recoil_m + 0x10, rx ) ) unity::safe_write< float >( recoil_m + 0x10, rx * scale );
@@ -820,7 +1004,7 @@ namespace esp {
 			}
 			if ( config::no_spread ) {
 				const uintptr_t fake_spread_m = unity::read_u64( client_m + 0x2C0 );
-				if ( unity::is_managed_ptr( fake_spread_m ) ) {
+				if ( unity::is_managed_ptr( fake_spread_m ) && unity::obj_contains( fake_spread_m, "Spread" ) ) {
 					unity::safe_write< float >( fake_spread_m + 0x10, 0.0f );
 					unity::safe_write< float >( fake_spread_m + 0x14, 0.0f );
 					unity::safe_write< float >( fake_spread_m + 0x18, 0.0f );
@@ -842,7 +1026,7 @@ namespace esp {
 					const uintptr_t sp_tgt = unity::is_managed_ptr( sp_fn ) ? unity::read_u64( sp_fn + 0x20 ) : 0;
 					const uintptr_t sp_desc = unity::is_managed_ptr( sp_tgt ) ? unity::read_u64( sp_tgt + 0x10 ) : 0;
 					const uintptr_t wpn_spread = unity::is_managed_ptr( sp_desc ) ? unity::read_u64( sp_desc + 0x20 ) : 0;
-					if ( unity::is_managed_ptr( wpn_spread ) ) {
+					if ( unity::is_managed_ptr( wpn_spread ) && unity::obj_contains( wpn_spread, "Spread" ) ) {
 						for ( uintptr_t off = 0x10; off <= 0x38; off += 0x08 ) {
 							const uintptr_t st = unity::read_u64( wpn_spread + off );
 							if ( unity::is_managed_ptr( st ) ) {
@@ -1311,8 +1495,10 @@ namespace esp {
 					copy_str( g_local_clan, sizeof( g_local_clan ), m.clan );
 					copy_str( g_local_weapon, sizeof( g_local_weapon ), m.weapon );
 				}
-				if ( m.is_dead ) {
-					// Record death point if not already recorded nearby
+				if ( m.is_dead && !m.is_local ) {
+					// Record death point if not already recorded nearby. The local player
+					// is skipped: a marker on your own corpse is noise, and on death the
+					// entry is the one being rebuilt.
 					bool found = false;
 					for ( int d = 0; d < 64; ++d ) {
 						if ( g_deaths[ d ].valid && dist3( g_deaths[ d ].pos, pos ) < 2.0f ) { found = true; break; }
@@ -1543,6 +1729,22 @@ namespace esp {
 		}
 		if ( s[ 0 ] == '_' ) ++s;
 
+		// Some loot descriptions only carry a numeric id. "46" on the map says
+		// nothing at all, so those fall back to a plain name.
+		if ( s[ 0 ] ) {
+			bool numeric = true;
+			for ( int i = 0; s[ i ]; ++i ) {
+				if ( !( ( s[ i ] >= '0' && s[ i ] <= '9' ) || s[ i ] == '-' || s[ i ] == '.' ) ) {
+					numeric = false;
+					break;
+				}
+			}
+			if ( numeric ) {
+				copy_str( out, cap, "LOOT" );
+				return;
+			}
+		}
+
 		size_t o = 0;
 		char prev = 0;
 		for ( int i = 0; s[ i ] && o + 2 < cap; ++i ) {
@@ -1626,6 +1828,11 @@ namespace esp {
 	}
 
 	inline void reset_scene_caches( ) {
+		// Release the aim writes before the pointers are dropped: the restore path
+		// checks the klass of every model, so a model that has already been freed
+		// is skipped instead of written back into whatever reused the address.
+		silent_release( );
+		forget_models( );
 		unity::reset_page_cache( );
 		g_camera = nullptr;
 		g_vp_valid = false;
@@ -1654,6 +1861,35 @@ namespace esp {
 		config::diag_models_read = 0;
 		config::model_chain_ok = false;
 		unity::g_unity_entry_obj = 0;
+	}
+
+	// Same as reset_scene_caches, but keeps the camera and the view-projection
+	// matrix that were just built for this frame. Used when the battle models are
+	// rebuilt under us (death / respawn) and the frame must still be drawn.
+	inline void reset_scene_caches_keep_view( ) {
+		silent_release( );
+		forget_models( );
+		g_locked_obj = nullptr;
+		g_has_aim_target = false;
+		g_has_silent_target = false;
+		g_aim_rem_x = 0.0f;
+		g_aim_rem_y = 0.0f;
+		g_meta_count = 0;
+		g_world_raw_count = 0;
+		g_value_probe_n = 0;
+		for ( int i = 0; i < 128; ++i ) {
+			g_bone_cache[ i ] = {};
+			g_vel_cache[ i ] = {};
+		}
+		for ( int i = 0; i < 512; ++i ) {
+			g_klass_names[ i ] = {};
+		}
+		g_player_count_buf[ 0 ] = 0;
+		g_player_count_buf[ 1 ] = 0;
+		g_world_count_buf[ 0 ] = 0;
+		g_world_count_buf[ 1 ] = 0;
+		config::diag_players_tracked = 0;
+		config::diag_world_tracked = 0;
 	}
 
 	inline void handle_hotkeys_and_camera( void* cam, uintptr_t battle_model ) {
@@ -1740,6 +1976,10 @@ namespace esp {
 	}
 
 	inline void collect( ) {
+		if ( InterlockedExchange( &g_force_reset, 0 ) != 0 ) {
+			reset_scene_caches( );
+			return;
+		}
 		const ULONGLONG now = GetTickCount64( );
 		static ULONGLONG s_last_collect = 0;
 		if ( s_last_collect != 0 && ( now - s_last_collect ) < 16 ) return;
@@ -1811,8 +2051,49 @@ namespace esp {
 			return;
 		}
 
+		// Death and respawn destroy and rebuild the battle models. Every pointer
+		// cached against the previous scene then refers to freed memory, so the
+		// caches are dropped at the first frame of the new one. Without this, the
+		// bone cache, the aim models and the weapon chain kept writing into reused
+		// addresses, which is what crashed the game on death.
+		if ( entities_model != g_scene_entities || battle_model != g_scene_battle ||
+			 local_ent_check != g_scene_local_ent ) {
+			reset_scene_caches_keep_view( );
+			g_scene_entities = entities_model;
+			g_scene_battle = battle_model;
+			g_scene_local_ent = local_ent_check;
+			g_local_char_model = unity::read_u64( local_ent_check + 0x20 );
+			g_local_dead = false;
+		}
+
+		// Local death flag, read from the same chain the ESP already uses for
+		// every player (common + 0xE0 is the dead bit). While it is set nothing
+		// may be written into the scene: the character is torn down a few frames
+		// later and the aim writes in particular must be released first.
+		bool local_dead_now = false;
+		{
+			const uintptr_t cm = g_local_char_model;
+			const uintptr_t cd = unity::is_managed_ptr( cm ) ? unity::read_u64( cm + 0x40 ) : 0;
+			const uintptr_t common = unity::is_managed_ptr( cd ) ? unity::read_u64( cd + 0x20 ) : 0;
+			if ( unity::is_managed_ptr( common ) ) {
+				uint8_t dead_b = 0;
+				if ( unity::read_prim_data( unity::read_u64( common + 0xE0 ), dead_b ) ) local_dead_now = ( dead_b != 0 );
+			}
+		}
+		if ( local_dead_now && !g_local_dead ) {
+			silent_release( );
+			g_locked_obj = nullptr;
+			g_has_aim_target = false;
+			g_has_silent_target = false;
+		}
+		g_local_dead = local_dead_now;
+
 		handle_hotkeys_and_camera( cam, battle_model );
-		apply_combat_and_misc_mods( battle_model, entities_model );
+		if ( !g_local_dead ) {
+			apply_combat_and_misc_mods( battle_model, entities_model );
+		} else {
+			silent_release( );
+		}
 		refresh_metadata_and_world_cache( now, battle_model, entities_model, slots_model );
 		project_world_cache( );
 
@@ -1894,6 +2175,7 @@ namespace esp {
 		float best_silent_fov = config::aim_silent_fov;
 		int best_silent_idx = -1;
 		vec2_t best_silent_screen{};
+		vec3_t best_silent_world{};
 		int bone_budget = 2;
 		// Each player with a resolved skeleton costs 19 native transform reads per
 		// frame: 128 players in range is ~2400 managed calls every frame. Past ~80 m
@@ -2007,6 +2289,7 @@ namespace esp {
 									unity::get_transform_pos_native( bc->native_nodes[ n2 ], np );
 								out.skel_p_ok[ n2 ] = got && world_to_screen( np, out.skel_p[ n2 ] );
 								if ( !got ) continue;
+								out.skel_pw[ n2 ] = np;
 								// Only nodes that belong to this body feed the vertical extent.
 								const float ndy = np.y - pos.y;
 								const float ndx = np.x - pos.x;
@@ -2081,7 +2364,7 @@ namespace esp {
 			const bool skip_friend = ( config::aim_ignore_friends && out.is_friend );
 			const bool skip_dead = out.is_dead;
 
-			if ( config::aim_master && on_scr && dist <= eff_aim_dist &&
+			if ( config::aim_master && !g_local_dead && on_scr && dist <= eff_aim_dist &&
 				 !skip_clan && !skip_police && !skip_knocked && !skip_friend && !skip_dead &&
 				 ( !config::aim_vis_check || out.is_visible ) ) {
 				vec3_t aim_w = select_aim_point( out, cx, cy, true );
@@ -2133,6 +2416,7 @@ namespace esp {
 						best_silent_fov = fov_d;
 						best_silent_idx = next_count;
 						best_silent_screen = aim_s;
+						best_silent_world = aim_w;
 					}
 				}
 			}
@@ -2223,7 +2507,7 @@ namespace esp {
 			const bool skip_police = ( config::aim_ignore_police && out.role_kind == ROLE_COP );
 			const bool skip_knocked = ( config::aim_ignore_knocked && out.is_knocked );
 			const bool skip_friend = ( config::aim_ignore_friends && out.is_friend );
-			if ( config::aim_master && out.on_screen && dist <= eff_aim_dist &&
+			if ( config::aim_master && !g_local_dead && out.on_screen && dist <= eff_aim_dist &&
 				 !skip_clan && !skip_police && !skip_knocked && !skip_friend && !out.is_dead &&
 				 ( !config::aim_vis_check || !unity::unity_linecast( g_cam_pos, out.head_world ) ) ) {
 				const vec3_t aim_w = select_aim_point( out, cx, cy, true );
@@ -2243,6 +2527,7 @@ namespace esp {
 						best_silent_fov = fov_d;
 						best_silent_idx = next_count;
 						best_silent_screen = aim_s;
+						best_silent_world = aim_w;
 					}
 				}
 			}
@@ -2275,14 +2560,17 @@ namespace esp {
 			g_aim_rem_y = 0.0f;
 		}
 
-		// Silent Aim
-		if ( config::aim_master && config::aim_mode == 2 && best_silent_idx >= 0 && dst[ best_silent_idx ].entity_id > 0 ) {
+		// Silent Aim: a class-verified direction pulse instead of a permanent write
+		// into a model that was only picked because its name looked right.
+		if ( config::aim_master && config::aim_mode == 2 && !g_local_dead &&
+			 best_silent_idx >= 0 && dst[ best_silent_idx ].entity_id > 0 ) {
 			g_silent_target_screen = best_silent_screen;
 			g_has_silent_target = true;
-			apply_silent_target( battle_model, dst[ best_silent_idx ].entity_id, g_is_firing_or_aiming );
+			silent_aim_update( battle_model, g_local_char_model, g_is_firing_or_aiming,
+				dst[ best_silent_idx ].entity_id, best_silent_world, now );
 		} else {
 			g_has_silent_target = false;
-			apply_silent_target( battle_model, -1, false );
+			silent_aim_update( battle_model, g_local_char_model, false, -1, vec3_t{}, now );
 		}
 
 		// Triggerbot
@@ -2413,6 +2701,30 @@ namespace esp {
 		d3d11_ui::add_circle( cx, hy, hr, 18, lw, c );
 	}
 
+	// A hierarchy link is exactly one bone: 2 cm to 55 cm, with both ends inside
+	// the body volume. Hair ties, straps, holstered props and stale transforms all
+	// produce longer links, and those were the lines that cut straight across the
+	// screen next to the player.
+	inline bool skel_link_ok( const player_t& p, int ia, int ib ) {
+		if ( ia < 0 || ib < 0 || ia >= 64 || ib >= 64 ) return false;
+		const vec3_t& a = p.skel_pw[ ia ];
+		const vec3_t& b = p.skel_pw[ ib ];
+		const float dx = a.x - b.x;
+		const float dy = a.y - b.y;
+		const float dz = a.z - b.z;
+		const float d2 = dx * dx + dy * dy + dz * dz;
+		if ( !( d2 == d2 ) || d2 < 0.0004f || d2 > 0.3025f ) return false;
+
+		const float lo = p.root_world.y - 0.45f;
+		const float hi = p.head_world.y + 0.35f;
+		if ( a.y < lo || a.y > hi || b.y < lo || b.y > hi ) return false;
+		const float ax = a.x - p.root_world.x;
+		const float az = a.z - p.root_world.z;
+		const float bx = b.x - p.root_world.x;
+		const float bz = b.z - p.root_world.z;
+		return ( ax * ax + az * az ) <= 2.25f && ( bx * bx + bz * bz ) <= 2.25f;
+	}
+
 	inline void draw_skeleton( const player_t& p, float body_h, const d3d11_ui::color_t& c ) {
 		const float lw = config::esp_skel_width > 0.5f ? config::esp_skel_width : 1.3f;
 		const d3d11_ui::color_t shadow{ 0.0f, 0.0f, 0.0f, c.a * 0.85f };
@@ -2421,8 +2733,11 @@ namespace esp {
 		// shape follows the pose whatever the rig looks like.
 		if ( p.skel_edge_count >= 4 ) {
 			for ( int e = 0; e < p.skel_edge_count; ++e ) {
-				const vec2_t& sa = p.skel_p[ p.skel_ea[ e ] ];
-				const vec2_t& sb = p.skel_p[ p.skel_eb[ e ] ];
+				const int ia = p.skel_ea[ e ];
+				const int ib = p.skel_eb[ e ];
+				if ( !skel_link_ok( p, ia, ib ) ) continue;
+				const vec2_t& sa = p.skel_p[ ia ];
+				const vec2_t& sb = p.skel_p[ ib ];
 				d3d11_ui::add_line( sa.x, sa.y, sb.x, sb.y, lw + 1.2f, shadow );
 				d3d11_ui::add_line( sa.x, sa.y, sb.x, sb.y, lw, c );
 			}
@@ -2544,29 +2859,53 @@ namespace esp {
 			bool locked = false;
 			char label[ 48 ]{};
 		};
+		// The same cupboard is published by several tables at once (container,
+		// loot object, loot node, loose loot), so drawing per item put three
+		// labels on one door and made the field unreadable. Everything loot-like
+		// inside 2.5 m is one label, and the most specific name wins.
+		auto is_lootish = []( int cat ) -> bool {
+			return cat == WCAT_LOOSE || cat == WCAT_NODE || cat == WCAT_CONTAINER || cat == WCAT_DROPPED;
+		};
+		auto cat_rank = []( int cat ) -> int {
+			if ( cat == WCAT_CONTAINER ) return 4;
+			if ( cat == WCAT_DOOR ) return 3;
+			if ( cat == WCAT_NODE ) return 2;
+			if ( cat == WCAT_DROPPED ) return 2;
+			return 1;
+		};
+
 		static world_group_t grp[ 96 ];
 		int n = 0;
 		for ( int i = 0; i < count; ++i ) {
 			const world_item_t& it = items[ i ];
 			if ( !it.valid ) continue;
 			const char* lbl = it.label[ 0 ] ? it.label : "ITEM";
+			const bool lootish = is_lootish( it.category );
 			int hit = -1;
 			for ( int g = 0; g < n; ++g ) {
-				if ( grp[ g ].category != it.category ) continue;
-				if ( !unity::str_eq( grp[ g ].label, lbl ) ) continue;
+				if ( is_lootish( grp[ g ].category ) != lootish ) continue;
 				if ( dist3( grp[ g ].world_pos, it.world_pos ) > 2.5f ) continue;
+				if ( !lootish &&
+					 ( grp[ g ].category != it.category || !unity::str_eq( grp[ g ].label, lbl ) ) ) continue;
 				hit = g;
 				break;
 			}
 			if ( hit >= 0 ) {
 				world_group_t& g = grp[ hit ];
-				++g.num;
+				if ( unity::str_eq( g.label, lbl ) ) ++g.num;
+				if ( lootish && cat_rank( it.category ) > cat_rank( g.category ) ) {
+					g.category = it.category;
+					g.rarity = it.rarity;
+					g.locked = it.locked;
+					g.value = it.value;
+					copy_str( g.label, sizeof( g.label ), lbl );
+				}
 				if ( it.distance < g.distance ) {
 					g.distance = it.distance;
 					g.world_pos = it.world_pos;
 					g.screen_pos = it.screen_pos;
-					g.value = it.value;
-					g.locked = it.locked;
+					if ( g.value <= 0 ) g.value = it.value;
+					g.locked = g.locked || it.locked;
 				}
 				continue;
 			}
@@ -2810,20 +3149,30 @@ namespace esp {
 				if ( d >= config::esp_snap_radius ) d3d11_ui::add_line( sx, sy, root_s.x, root_s.y, 1.0f, col );
 			}
 
-			// Overlap suppression (mode 1)
+						// Label collision. Two players standing together used to have their names
+			// and their distance lines drawn on top of each other, which is what made
+			// the text unreadable. It now always runs instead of only in one optional
+			// priority mode, and it compares label boxes (a name is wide, a distance
+			// line is not) instead of a single point.
 			bool suppress_text = minimal_noise || tiny_target;
-			if ( config::esp_priority_mode == 1 ) {
+			{
+				const float name_w = 70.0f;
+				const float name_h = 13.0f;
 				for ( int k = 0; k < drawn_label_cnt; ++k ) {
-					if ( d3d11_ui::fast_sqrt( ( head_s.x - drawn_labels[ k ].x ) * ( head_s.x - drawn_labels[ k ].x ) +
-											  ( box_y - drawn_labels[ k ].y ) * ( box_y - drawn_labels[ k ].y ) ) < 26.0f ) {
-						suppress_text = true;
-						break;
-					}
+					if ( head_s.x + name_w < drawn_labels[ k ].x - name_w ) continue;
+					if ( head_s.x - name_w > drawn_labels[ k ].x + name_w ) continue;
+					if ( box_y + name_h < drawn_labels[ k ].y - name_h ) continue;
+					if ( box_y - name_h > drawn_labels[ k ].y + name_h ) continue;
+					suppress_text = true;
+					break;
 				}
 			}
 			if ( !suppress_text && drawn_label_cnt < 64 ) {
 				drawn_labels[ drawn_label_cnt++ ] = { head_s.x, box_y };
 				float ty = box_y - 12.0f;
+				// A player above the top edge had every label clipped off the screen;
+				// pushing them under the box keeps them readable.
+				if ( ty < 16.0f ) ty = box_y + box_h + 14.0f;
 				if ( config::esp_name && ( p.name[ 0 ] || p.tag[ 0 ] ) ) {
 					char line[ 80 ]{};
 					char* lend = line + sizeof( line ) - 1;

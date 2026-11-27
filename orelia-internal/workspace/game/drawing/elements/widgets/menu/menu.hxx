@@ -24,6 +24,21 @@ namespace menu {
 	}
 
 	inline void update_input( ) {
+		// The game captures and clips the cursor while playing: without releasing
+		// the clip the OS cursor stays pinned to the centre and no widget can ever
+		// be hovered, which makes the menu unusable in game.
+		static bool s_cursor_released = false;
+		if ( config::menu_open ) {
+			ClipCursor( nullptr );
+			if ( !s_cursor_released ) {
+				ShowCursor( TRUE );
+				s_cursor_released = true;
+			}
+		} else if ( s_cursor_released ) {
+			ShowCursor( FALSE );
+			s_cursor_released = false;
+		}
+
 		POINT pt{};
 		GetCursorPos( &pt );
 		if ( d3d11_ui::g_hwnd ) ScreenToClient( d3d11_ui::g_hwnd, &pt );
@@ -36,10 +51,11 @@ namespace menu {
 
 	inline void render_plot_panel( ) {
 		if ( !config::plot_panel_enabled || !config::model_chain_ok || !esp::g_camera ) return;
+		if ( !esp::g_nearest_plot.valid ) return;
 		const float px = d3d11_ui::g_width - 270.0f;
 		const float py = 18.0f;
 		const float pw = 252.0f;
-		const float ph = 182.0f;
+		const float ph = 128.0f;
 		d3d11_ui::add_shadow_rect( px, py, pw, ph, 6.0f, 0.25f );
 		d3d11_ui::add_filled_rounded_rect( px, py, pw, ph, 6.0f, { 0.055f, 0.063f, 0.094f, 0.90f } );
 		d3d11_ui::add_rounded_rect( px, py, pw, ph, 6.0f, 1.0f, { 0.20f, 0.24f, 0.36f, 0.95f } );
@@ -47,20 +63,14 @@ namespace menu {
 
 		const auto& pl = esp::g_nearest_plot;
 		char buf[ 64 ]{};
-		wsprintfA( buf, "Dist: %dm | Owner: %s", static_cast< int >( pl.distance ), pl.owner[ 0 ] ? pl.owner : "None" );
+		wsprintfA( buf, "Dist: %dm", static_cast< int >( pl.distance ) );
 		d3d11_ui::add_text_outlined( px + 10.0f, py + 32.0f, buf, { 0.90f, 0.92f, 0.98f, 1.0f }, 0.76f );
-		wsprintfA( buf, "Cash/Laundry: $%d (ETA %ds)", pl.cash_laundry, pl.laundry_eta_s );
-		d3d11_ui::add_text_outlined( px + 10.0f, py + 50.0f, buf, { 0.28f, 0.92f, 0.58f, 1.0f }, 0.76f );
 		wsprintfA( buf, "Storages: %d | Full Cont: %d", pl.storages, pl.full_containers );
-		d3d11_ui::add_text_outlined( px + 10.0f, py + 68.0f, buf, { 0.90f, 0.92f, 0.98f, 1.0f }, 0.76f );
-		wsprintfA( buf, "Bushes (U/R/E): %d / %d / %d", pl.bushes_by_rarity[ 2 ], pl.bushes_by_rarity[ 3 ], pl.bushes_by_rarity[ 4 ] );
-		d3d11_ui::add_text_outlined( px + 10.0f, py + 86.0f, buf, { 0.98f, 0.78f, 0.25f, 1.0f }, 0.76f );
-		wsprintfA( buf, "Defenses: %d | Fuses Needed: %d", pl.defenses_count, pl.elec_fuses_needed );
-		d3d11_ui::add_text_outlined( px + 10.0f, py + 104.0f, buf, { 0.97f, 0.34f, 0.38f, 1.0f }, 0.76f );
-		wsprintfA( buf, "Closed Doors: %d | Cargo: %d", pl.closed_doors, pl.cargo_count );
-		d3d11_ui::add_text_outlined( px + 10.0f, py + 122.0f, buf, { 0.90f, 0.92f, 0.98f, 1.0f }, 0.76f );
+		d3d11_ui::add_text_outlined( px + 10.0f, py + 50.0f, buf, { 0.90f, 0.92f, 0.98f, 1.0f }, 0.76f );
+		wsprintfA( buf, "Loot Nodes Nearby: %d", pl.bushes_by_rarity[ 2 ] );
+		d3d11_ui::add_text_outlined( px + 10.0f, py + 68.0f, buf, { 0.98f, 0.78f, 0.25f, 1.0f }, 0.76f );
 		wsprintfA( buf, "Parked Vehicles: %d", pl.parked_vehicles );
-		d3d11_ui::add_text_outlined( px + 10.0f, py + 140.0f, buf, { 0.30f, 0.78f, 1.00f, 1.0f }, 0.76f );
+		d3d11_ui::add_text_outlined( px + 10.0f, py + 86.0f, buf, { 0.30f, 0.78f, 1.00f, 1.0f }, 0.76f );
 	}
 
 	inline void render_player_list( ) {
@@ -186,7 +196,6 @@ namespace menu {
 			static constexpr const char* k_modes[] = { "Mouse Assist", "Direct 3D (6B)", "Silent Aim" };
 			static constexpr const char* k_keys[] = { "RMB", "LMB", "Shift", "X2", "Alt" };
 			static constexpr const char* k_bones[] = { "Head", "Neck", "Chest", "Pelvis", "Stomach", "Arms", "Legs", "Face", "Hands", "Feet", "Closest" };
-			static constexpr const char* k_vis[] = { "Native Raycast", "Unity Raycast", "BVH + Hull" };
 
 			draw_chk( cx1, y1, cw, "Aim Master", config::aim_master );
 			draw_cyc( cx1, y1, cw, "Aim Mode", config::aim_mode, k_modes, 3 );
@@ -209,7 +218,6 @@ namespace menu {
 			draw_chk( cx2, y2, cw, "Motion Prediction", config::pred_enabled );
 			draw_chk( cx2, y2, cw, "Multipoint Hitboxes", config::aim_multipoint );
 			draw_chk( cx2, y2, cw, "Visible Only (LoS)", config::aim_vis_check );
-			draw_cyc( cx2, y2, cw, "LoS Mode", config::aim_vis_mode, k_vis, 3 );
 			draw_chk( cx2, y2, cw, "Weapon-Aware Aim", config::aim_weapon_aware );
 			draw_chk( cx2, y2, cw, "Ignore Clan", config::aim_ignore_clan );
 			draw_chk( cx2, y2, cw, "Ignore Police", config::aim_ignore_police );
@@ -255,12 +263,9 @@ namespace menu {
 			draw_chk( cx1, y1, cw, "Hide Empty Containers", config::world_hide_empty );
 
 			draw_chk( cx2, y2, cw, "Dropped Loot", config::world_dropped );
-			draw_chk( cx2, y2, cw, "Vehicle Cargo Loot", config::world_veh_loot );
-			draw_chk( cx2, y2, cw, "Money Tables / Buyers", config::world_buyers );
 			draw_sld( cx2, y2, cw, "Loot Render Dist", config::world_loot_dist, 40.0f, 500.0f, "%d m" );
 			draw_chk( cx2, y2, cw, "Cars ESP", config::world_cars );
 			draw_chk( cx2, y2, cw, "Helicopters ESP", config::world_helis );
-			draw_chk( cx2, y2, cw, "Police Vehicles", config::world_police_veh );
 			draw_chk( cx2, y2, cw, "Hide Local Vehicle", config::world_hide_local_veh );
 			draw_sld( cx2, y2, cw, "Vehicle Render Dist", config::world_veh_dist, 50.0f, 800.0f, "%d m" );
 		} else {
@@ -268,10 +273,7 @@ namespace menu {
 			static constexpr const char* k_dr_keys[] = { "G", "E", "F", "T" };
 			static constexpr const char* k_pl_keys[] = { "F6", "F7", "F9", "P" };
 			static constexpr const char* k_ls_keys[] = { "TAB", "F2", "F3", "L" };
-			static constexpr const char* k_prios[] = {
-				"Z-Order", "Overlap Suppress", "Split Veh/Player", "Merge 1 Occ",
-				"Unified 2+ Crew", "Compact >100m", "Min Noise Fire/Aim"
-			};
+			static constexpr const char* k_prios[] = { "Z-Order", "Overlap Suppress", "Min Noise Fire/Aim" };
 
 			draw_chk( cx1, y1, cw, "Free Cam", config::freecam_enabled );
 			draw_cyc( cx1, y1, cw, "Free Cam Key", config::freecam_key, k_fc_keys, 4 );
@@ -286,7 +288,7 @@ namespace menu {
 			draw_cyc( cx2, y2, cw, "Plot Panel Key", config::plot_panel_key, k_pl_keys, 4 );
 			draw_chk( cx2, y2, cw, "Player Roster Window", config::player_list_open );
 			draw_cyc( cx2, y2, cw, "Player List Key", config::player_list_key, k_ls_keys, 4 );
-			draw_cyc( cx2, y2, cw, "ESP Priority Mode", config::esp_priority_mode, k_prios, 7 );
+			draw_cyc( cx2, y2, cw, "ESP Priority Mode", config::esp_priority_mode, k_prios, 3 );
 		}
 
 		const float max_y = ( y1 > y2 ? y1 : y2 ) + g_scroll_y[ tab ];

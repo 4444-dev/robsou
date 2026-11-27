@@ -23,6 +23,12 @@ namespace dx11_hook {
 	constexpr LONG late_update_max_attempts = 20;
 	constexpr DWORD late_update_retry_ms = 500;
 
+	// Wiping the PE headers is a stealth measure, but it also destroys the export
+	// table: g_obs_slot and dpc_entry become unresolvable and the reflective
+	// loader can no longer find "DllMain". Only enable it if nothing resolves
+	// exports in this module after load.
+	constexpr bool wipe_headers = false;
+
 	inline void hk_late_update( void* self, void* method ) {
 		if ( o_late_update ) {
 			o_late_update( self, method );
@@ -86,25 +92,25 @@ namespace dx11_hook {
 			|| executable == PAGE_EXECUTE_WRITECOPY;
 	}
 
+	// Only real failures burn the retry budget. "GameAssembly not loaded yet" and
+	// "Cinemachine not loaded yet" are normal during loading screens and must not
+	// consume attempts, otherwise the hook is abandoned ten seconds after the
+	// process starts.
+	//
+	// State: 0 idle, 1 installing, 2 installed, 3 failed for this session. There is
+	// no re-arm: after a failure the scene flag stays false (the LateUpdate hook is
+	// what updates it), so re-arming on "scene not ready" would retry forever.
 	inline void try_install_main_hook( ) {
-		const LONG state = InterlockedCompareExchange( &g_late_update_state, 0, 0 );
-		if ( state == 1 || state == 2 || state == 3 ) return;
-		if ( g_late_update_slot ) return;
+		if ( InterlockedCompareExchange( &g_late_update_state, 0, 0 ) != 0 ) return;
 
 		static ULONGLONG s_last_try = 0;
 		const ULONGLONG now = GetTickCount64( );
 		if ( s_last_try != 0 && now - s_last_try < late_update_retry_ms ) return;
 		s_last_try = now;
 
-		const LONG attempts = InterlockedIncrement( &g_late_update_attempts );
-		if ( attempts > late_update_max_attempts ) {
-			InterlockedExchange( &g_late_update_state, 3 );
-			config::il2cpp_hook_ready = false;
-			config::il2cpp_hook_failed = true;
-			return;
-		}
-
 		if ( InterlockedCompareExchange( &g_late_update_state, 1, 0 ) != 0 ) return;
+
+		bool hard_fail = false;
 
 		__try {
 			HMODULE ga = GetModuleHandleA( "GameAssembly.dll" );
@@ -140,17 +146,23 @@ namespace dx11_hook {
 			for ( size_t i = 0; i < count; ++i ) {
 				void* img = f_img( asms[ i ] );
 				if ( !img ) continue;
-				if ( !unity::str_eq( f_name( img ), "Cinemachine.dll" ) ) continue;
+				if ( !unity::str_ieq( f_name( img ), "Cinemachine.dll" ) ) continue;
 
 				void* brain_cls = f_cls( img, "Cinemachine", "CinemachineBrain" );
 				if ( !brain_cls ) break;
 
 				void* mi = f_meth( brain_cls, "LateUpdate", 0 );
-				if ( !is_method_pointer_valid( mi ) ) break;
+				if ( !is_method_pointer_valid( mi ) ) {
+					// Assembly present but the method pointer does not check out:
+					// that is a genuine offset mismatch (game update).
+					hard_fail = true;
+					break;
+				}
 
 				void** slot = reinterpret_cast< void** >( mi );
 				if ( *slot == reinterpret_cast< void* >( &hk_late_update ) ) {
 					g_late_update_slot = slot;
+					InterlockedExchange( &g_late_update_attempts, 0 );
 					InterlockedExchange( &g_late_update_state, 2 );
 					config::il2cpp_hook_ready = true;
 					config::il2cpp_hook_failed = false;
@@ -163,23 +175,34 @@ namespace dx11_hook {
 					InterlockedExchangePointer( slot, reinterpret_cast< void* >( &hk_late_update ) );
 					VirtualProtect( slot, sizeof( void* ), old_prot, &old_prot );
 					g_late_update_slot = slot;
+					InterlockedExchange( &g_late_update_attempts, 0 );
 					InterlockedExchange( &g_late_update_state, 2 );
 					config::il2cpp_hook_ready = true;
 					config::il2cpp_hook_failed = false;
 					return;
 				}
+				hard_fail = true;
 				break;
 			}
 		}
 		__except ( EXCEPTION_EXECUTE_HANDLER ) {
+			hard_fail = true;
+		}
+
+		if ( hard_fail && InterlockedIncrement( &g_late_update_attempts ) > late_update_max_attempts ) {
+			InterlockedExchange( &g_late_update_state, 3 );
+			config::il2cpp_hook_ready = false;
+			config::il2cpp_hook_failed = true;
+			return;
 		}
 		InterlockedExchange( &g_late_update_state, 0 );
 	}
 
 	inline HRESULT __stdcall hk_present( IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags, void* present_params ) {
 		__try {
+			// Installing the IL2CPP hook must not depend on the UI being sized.
+			try_install_main_hook( );
 			if ( d3d11_ui::g_width > 0.0f && d3d11_ui::g_height > 0.0f ) {
-				try_install_main_hook( );
 				__try { esp::render( ); } __except ( EXCEPTION_EXECUTE_HANDLER ) {}
 				menu::tick( );
 			}
@@ -193,43 +216,20 @@ namespace dx11_hook {
 	}
 
 	inline HRESULT __stdcall hk_resize_buffers( IDXGISwapChain* swap_chain, UINT buffer_count, UINT width, UINT height, DXGI_FORMAT new_format, UINT swap_chain_flags ) {
-		if ( d3d11_ui::g_rtv ) {
-			d3d11_ui::g_rtv->Release( );
-			d3d11_ui::g_rtv = nullptr;
-		}
-		return o_resize_buffers ? o_resize_buffers( swap_chain, buffer_count, width, height, new_format, swap_chain_flags ) : S_OK;
+		// The render target and the cached size both survive ResizeBuffers: drop
+		// them so render_frame rebuilds against the new back buffer.
+		d3d11_ui::invalidate_back_buffer( );
+		if ( !o_resize_buffers ) return E_FAIL;
+		return o_resize_buffers( swap_chain, buffer_count, width, height, new_format, swap_chain_flags );
 	}
 
-	inline uintptr_t find_obs_present_slot( HMODULE gh, HMODULE dxgi ) {
-		if ( !gh || !dxgi ) return 0;
+	// A throwaway window + device whose only purpose is to hand out the shared
+	// DXGI swap chain vtable (and the real Present address).
+	inline bool make_temp_swap_chain( IDXGISwapChain** out_sc, ID3D11Device** out_dev, ID3D11DeviceContext** out_ctx ) {
+		*out_sc = nullptr;
+		*out_dev = nullptr;
+		*out_ctx = nullptr;
 
-		auto* dxgi_dos = reinterpret_cast< PIMAGE_DOS_HEADER >( dxgi );
-		auto* dxgi_nt = reinterpret_cast< PIMAGE_NT_HEADERS64 >( reinterpret_cast< uintptr_t >( dxgi ) + dxgi_dos->e_lfanew );
-		uintptr_t dxgi_start = reinterpret_cast< uintptr_t >( dxgi );
-		uintptr_t dxgi_end = dxgi_start + dxgi_nt->OptionalHeader.SizeOfImage;
-
-		auto* gh_dos = reinterpret_cast< PIMAGE_DOS_HEADER >( gh );
-		auto* gh_nt = reinterpret_cast< PIMAGE_NT_HEADERS64 >( reinterpret_cast< uintptr_t >( gh ) + gh_dos->e_lfanew );
-		auto* sec = IMAGE_FIRST_SECTION( gh_nt );
-
-		for ( WORD i = 0; i < gh_nt->FileHeader.NumberOfSections; ++i ) {
-			bool writable = ( sec[ i ].Characteristics & IMAGE_SCN_MEM_WRITE ) != 0;
-			bool executable = ( sec[ i ].Characteristics & IMAGE_SCN_MEM_EXECUTE ) != 0;
-			if ( !writable || executable ) continue;
-
-			uintptr_t sec_start = reinterpret_cast< uintptr_t >( gh ) + sec[ i ].VirtualAddress;
-			DWORD sec_size = sec[ i ].Misc.VirtualSize ? sec[ i ].Misc.VirtualSize : sec[ i ].SizeOfRawData;
-			for ( DWORD off = 0; off + sizeof( uintptr_t ) <= sec_size; off += sizeof( uintptr_t ) ) {
-				uintptr_t val = *reinterpret_cast< uintptr_t* >( sec_start + off );
-				if ( val >= dxgi_start && val < dxgi_end ) {
-					return sec_start + off;
-				}
-			}
-		}
-		return 0;
-	}
-
-	inline bool install_dxgi_vtable_hook( ) {
 		WNDCLASSEXA wc{};
 		wc.cbSize = sizeof( wc );
 		wc.lpfnWndProc = DefWindowProcA;
@@ -252,45 +252,75 @@ namespace dx11_hook {
 		sd.Windowed = TRUE;
 		sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-		IDXGISwapChain* sc = nullptr;
-		ID3D11Device* dev = nullptr;
-		ID3D11DeviceContext* ctx = nullptr;
 		D3D_FEATURE_LEVEL fl{};
 		HRESULT hr = D3D11CreateDeviceAndSwapChain(
 			nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-			nullptr, 0, D3D11_SDK_VERSION, &sd, &sc, &dev, &fl, &ctx );
-		if ( FAILED( hr ) || !sc ) {
-			if ( ctx ) ctx->Release( );
-			if ( dev ) dev->Release( );
-			DestroyWindow( tmp_hwnd );
-			UnregisterClassA( wc.lpszClassName, wc.hInstance );
-			return false;
-		}
+			nullptr, 0, D3D11_SDK_VERSION, &sd, out_sc, out_dev, &fl, out_ctx );
 
-		void** vtable = *reinterpret_cast< void*** >( sc );
-		g_swapchain_vtable = vtable;
-		DWORD old_prot = 0;
-		bool ok = false;
-		if ( vtable && vtable[ 8 ] == reinterpret_cast< void* >( &hk_present ) ) {
-			ok = true;
-		}
-		else if ( vtable && VirtualProtect( &vtable[ 8 ], sizeof( void* ) * 6, PAGE_EXECUTE_READWRITE, &old_prot ) ) {
-			o_present = reinterpret_cast< present_fn >( vtable[ 8 ] );
-			InterlockedExchangePointer( &vtable[ 8 ], reinterpret_cast< PVOID >( &hk_present ) );
-			if ( vtable[ 13 ] && vtable[ 13 ] != reinterpret_cast< void* >( &hk_resize_buffers ) ) {
-				o_resize_buffers = reinterpret_cast< resize_fn >( vtable[ 13 ] );
-				InterlockedExchangePointer( &vtable[ 13 ], reinterpret_cast< PVOID >( &hk_resize_buffers ) );
-			}
-			VirtualProtect( &vtable[ 8 ], sizeof( void* ) * 6, old_prot, &old_prot );
-			ok = true;
-		}
-
-		sc->Release( );
-		if ( ctx ) ctx->Release( );
-		if ( dev ) dev->Release( );
 		DestroyWindow( tmp_hwnd );
 		UnregisterClassA( wc.lpszClassName, wc.hInstance );
-		return ok;
+
+		if ( FAILED( hr ) || !*out_sc ) {
+			if ( *out_ctx ) { ( *out_ctx )->Release( ); *out_ctx = nullptr; }
+			if ( *out_dev ) { ( *out_dev )->Release( ); *out_dev = nullptr; }
+			return false;
+		}
+		return true;
+	}
+
+	// OBS keeps a copy of the original Present pointer in one of the writable
+	// sections of graphics-hook64.dll. Matching "any pointer that lands inside
+	// dxgi.dll" hooks the wrong slot (an import thunk, a cached ResizeBuffers,
+	// ...), so the candidate has to be the exact Present address.
+	inline uintptr_t find_obs_present_slot( HMODULE gh, void* want_present ) {
+		if ( !gh || !want_present ) return 0;
+
+		auto* gh_dos = reinterpret_cast< PIMAGE_DOS_HEADER >( gh );
+		if ( !gh_dos || gh_dos->e_magic != IMAGE_DOS_SIGNATURE ) return 0;
+		auto* gh_nt = reinterpret_cast< PIMAGE_NT_HEADERS64 >( reinterpret_cast< uintptr_t >( gh ) + gh_dos->e_lfanew );
+		if ( !gh_nt || gh_nt->Signature != IMAGE_NT_SIGNATURE ) return 0;
+
+		const uintptr_t want = reinterpret_cast< uintptr_t >( want_present );
+		auto* sec = IMAGE_FIRST_SECTION( gh_nt );
+
+		for ( WORD i = 0; i < gh_nt->FileHeader.NumberOfSections; ++i ) {
+			const bool writable = ( sec[ i ].Characteristics & IMAGE_SCN_MEM_WRITE ) != 0;
+			const bool executable = ( sec[ i ].Characteristics & IMAGE_SCN_MEM_EXECUTE ) != 0;
+			if ( !writable || executable ) continue;
+
+			const uintptr_t sec_start = reinterpret_cast< uintptr_t >( gh ) + sec[ i ].VirtualAddress;
+			const DWORD sec_size = sec[ i ].Misc.VirtualSize ? sec[ i ].Misc.VirtualSize : sec[ i ].SizeOfRawData;
+			if ( sec_size < sizeof( uintptr_t ) ) continue;
+
+			for ( DWORD off = 0; off + sizeof( uintptr_t ) <= sec_size; off += sizeof( uintptr_t ) ) {
+				// Per-word probe rather than a whole-section one: the tail page of a
+				// section is not always committed.
+				if ( !unity::is_mem_readable( sec_start + off, sizeof( uintptr_t ) ) ) continue;
+				if ( *reinterpret_cast< uintptr_t* >( sec_start + off ) == want ) {
+					return sec_start + off;
+				}
+			}
+		}
+		return 0;
+	}
+
+	inline bool hook_swap_chain_vtable( void** vtable ) {
+		if ( !vtable || !vtable[ 8 ] ) return false;
+		if ( vtable[ 8 ] == reinterpret_cast< void* >( &hk_present ) ) return true;
+
+		DWORD old_prot = 0;
+		if ( !VirtualProtect( &vtable[ 8 ], sizeof( void* ) * 6, PAGE_EXECUTE_READWRITE, &old_prot ) )
+			return false;
+
+		g_swapchain_vtable = vtable;
+		o_present = reinterpret_cast< present_fn >( vtable[ 8 ] );
+		InterlockedExchangePointer( &vtable[ 8 ], reinterpret_cast< PVOID >( &hk_present ) );
+		if ( vtable[ 13 ] && vtable[ 13 ] != reinterpret_cast< void* >( &hk_resize_buffers ) ) {
+			o_resize_buffers = reinterpret_cast< resize_fn >( vtable[ 13 ] );
+			InterlockedExchangePointer( &vtable[ 13 ], reinterpret_cast< PVOID >( &hk_resize_buffers ) );
+		}
+		VirtualProtect( &vtable[ 8 ], sizeof( void* ) * 6, old_prot, &old_prot );
+		return true;
 	}
 
 	inline void register_seh_pdata( std::uint64_t module_base ) {
@@ -341,21 +371,55 @@ namespace dx11_hook {
 			return true;
 		}
 
-		HMODULE gh = GetModuleHandleA( "graphics-hook64.dll" );
-		HMODULE dxgi = GetModuleHandleA( "dxgi.dll" );
-		uintptr_t slot = find_obs_present_slot( gh, dxgi );
-		if ( slot ) {
-			if ( *reinterpret_cast< void** >( slot ) == reinterpret_cast< void* >( &hk_present ) )
-				return true;
-			o_present = reinterpret_cast< present_fn >( *reinterpret_cast< uintptr_t* >( slot ) );
-			InterlockedExchangePointer(
-				reinterpret_cast< volatile PVOID* >( slot ),
-				reinterpret_cast< PVOID >( &hk_present )
-			);
-			return true;
+		// One throwaway device is enough: it yields both the shared swap chain
+		// vtable and the real Present address used to identify the OBS slot.
+		IDXGISwapChain* sc = nullptr;
+		ID3D11Device* dev = nullptr;
+		ID3D11DeviceContext* ctx = nullptr;
+		if ( !make_temp_swap_chain( &sc, &dev, &ctx ) ) return false;
+
+		void** vtable = *reinterpret_cast< void*** >( sc );
+		bool ok = false;
+		if ( vtable ) {
+			const uintptr_t slot = find_obs_present_slot( GetModuleHandleA( "graphics-hook64.dll" ), vtable[ 8 ] );
+			if ( slot ) {
+				if ( *reinterpret_cast< void** >( slot ) != reinterpret_cast< void* >( &hk_present ) ) {
+					o_present = reinterpret_cast< present_fn >( *reinterpret_cast< uintptr_t* >( slot ) );
+					InterlockedExchangePointer(
+						reinterpret_cast< volatile PVOID* >( slot ),
+						reinterpret_cast< PVOID >( &hk_present )
+					);
+				}
+				ok = true;
+			}
+			else {
+				ok = hook_swap_chain_vtable( vtable );
+			}
 		}
 
-		return install_dxgi_vtable_hook( );
+		sc->Release( );
+		if ( ctx ) ctx->Release( );
+		if ( dev ) dev->Release( );
+		return ok;
+	}
+
+	// Runs on its own thread: creating a D3D11 device (and hooking vtables) from
+	// DllMain happens under the loader lock and can deadlock the process.
+	inline DWORD WINAPI init_thread( void* ) {
+		for ( int i = 0; i < 40; ++i ) {
+			if ( GetModuleHandleA( "dxgi.dll" ) ) break;
+			Sleep( 50 );
+		}
+
+		for ( int attempt = 0; attempt < 20; ++attempt ) {
+			__try {
+				if ( install( ) ) return 0;
+			}
+			__except ( EXCEPTION_EXECUTE_HANDLER ) {
+			}
+			Sleep( 250 );
+		}
+		return 0;
 	}
 }
 
@@ -380,12 +444,9 @@ extern "C" __declspec( dllexport ) BOOL APIENTRY DllMain(
 	if ( reason == DLL_PROCESS_ATTACH ) {
 		if ( !module_base ) return FALSE;
 		dx11_hook::register_seh_pdata( module_base );
-		__try {
-			dx11_hook::install( );
-		}
-		__except ( EXCEPTION_EXECUTE_HANDLER ) {
-		}
-		dx11_hook::wipe_pe_headers( module_base );
+		if ( dx11_hook::wipe_headers ) dx11_hook::wipe_pe_headers( module_base );
+		HANDLE thread = CreateThread( nullptr, 0, &dx11_hook::init_thread, nullptr, 0, nullptr );
+		if ( thread ) CloseHandle( thread );
 	}
 	return TRUE;
 }

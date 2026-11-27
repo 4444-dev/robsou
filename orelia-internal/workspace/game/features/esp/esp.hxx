@@ -1,5 +1,6 @@
 // orelia-internal/workspace/game/features/esp/esp.hxx
 #pragma once
+#include <cmath>
 #include <workspace/game/unity_il2cpp.hxx>
 #include <workspace/game/features/features.h>
 #include <workspace/game/drawing/drawing.h>
@@ -209,6 +210,7 @@ namespace esp {
 		void* bone_trs[ k_bone_count ]{};
 		uintptr_t native_bone_trs[ k_bone_count ]{};
 		bool has_bones = false;
+		ULONGLONG resolved_tick = 0;
 		ULONGLONG last_try = 0;
 	};
 	inline bone_cache_t g_bone_cache[ 128 ]{};
@@ -304,7 +306,9 @@ namespace esp {
 		}
 
 		bone_cache_t& bc = g_bone_cache[ slot ];
-		if ( bc.has_bones && unity::is_valid_obj( bc.bone_trs[ 0 ] ) ) {
+		// TTL: the GC reuses addresses, so a pointer-keyed cache without expiry ends
+		// up drawing the skeleton of a completely different player.
+		if ( bc.has_bones && ( now - bc.resolved_tick ) < 3000 && unity::is_valid_obj( bc.bone_trs[ 0 ] ) ) {
 			return &bc;
 		}
 		if ( budget <= 0 || ( bc.last_try != 0 && ( now - bc.last_try ) < 1500 ) ) {
@@ -332,6 +336,7 @@ namespace esp {
 				}
 				if ( valid_cnt >= 6 ) {
 					bc.has_bones = true;
+					bc.resolved_tick = now;
 					return &bc;
 				}
 			}
@@ -392,6 +397,17 @@ namespace esp {
 		return ( GetAsyncKeyState( vk ) & 0x8000 ) != 0;
 	}
 
+	// xorshift: cheap enough to roll once per frame, no CRT state, no syscall.
+	inline bool roll_percent( float chance ) {
+		if ( chance >= 100.0f ) return true;
+		if ( chance <= 0.0f ) return false;
+		static uint32_t s_state = 0x9E3779B9u;
+		s_state ^= s_state << 13;
+		s_state ^= s_state >> 17;
+		s_state ^= s_state << 5;
+		return ( s_state % 10000u ) < static_cast< uint32_t >( chance * 100.0f );
+	}
+
 	inline void apply_mouse_aim_delta( float dx, float dy ) {
 		const float smooth = config::aim_smooth > 1.0f ? config::aim_smooth : 1.0f;
 		const float sens = config::aim_sens_calib > 0.1f ? config::aim_sens_calib : 1.0f;
@@ -436,10 +452,10 @@ namespace esp {
 		float target_yaw = 0.0f;
 		// atan2 approx via sin/cos or standard math
 		{
-			const float ang = static_cast< float >( __builtin_atan2( dx, dz ) ) * k_rad2deg;
+			const float ang = static_cast< float >( std::atan2( dx, dz ) ) * k_rad2deg;
 			target_yaw = ang;
 		}
-		const float target_pitch = -static_cast< float >( __builtin_atan2( dy, horiz ) ) * k_rad2deg;
+		const float target_pitch = -static_cast< float >( std::atan2( dy, horiz ) ) * k_rad2deg;
 
 		// Detect radian vs degree storage from quaternion at +0x1C
 		float scale = 1.0f;
@@ -447,8 +463,8 @@ namespace esp {
 		const float qlen2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
 		if ( qlen2 > 0.95f && qlen2 < 1.05f ) {
 			const float sinp = d3d11_ui::clampf( 2.0f * ( q.w * q.x - q.y * q.z ), -1.0f, 1.0f );
-			const float qpitch = static_cast< float >( __builtin_asin( sinp ) ) * k_rad2deg;
-			const float qyaw = static_cast< float >( __builtin_atan2( 2.0f * ( q.w * q.y + q.x * q.z ), 1.0f - 2.0f * ( q.x * q.x + q.y * q.y ) ) ) * k_rad2deg;
+			const float qpitch = static_cast< float >( std::asin( sinp ) ) * k_rad2deg;
+			const float qyaw = static_cast< float >( std::atan2( 2.0f * ( q.w * q.y + q.x * q.z ), 1.0f - 2.0f * ( q.x * q.x + q.y * q.y ) ) ) * k_rad2deg;
 			if ( ( cur_yaw > -6.5f && cur_yaw < 6.5f && ( qyaw > 10.0f || qyaw < -10.0f ) ) ||
 				 ( cur_pitch > -1.6f && cur_pitch < 1.6f && ( qpitch > 5.0f || qpitch < -5.0f ) ) ) {
 				scale = k_deg2rad;
@@ -640,6 +656,9 @@ namespace esp {
 				const uint8_t btype = unity::read_u8( elem + 4 );
 				uintptr_t arr = ( btype == st_type ) ? st_bodies : ( btype == dy_type ? dy_bodies : 0 );
 				if ( !unity::is_managed_ptr( arr ) ) continue;
+				if ( bval < 0 ) continue;
+				const int32_t arr_len = unity::read_i32( arr + 0x18 );
+				if ( arr_len <= 0 || bval >= arr_len ) continue;
 				const uintptr_t rb = arr + 0x20 + static_cast< size_t >( bval ) * 0xCC;
 				int32_t flags = 0;
 				if ( unity::safe_read( rb + 0x00, flags ) ) {
@@ -673,9 +692,36 @@ namespace esp {
 		}
 	}
 
+	// get_class_name walks the klass name string for every entity on every metadata
+	// refresh. Every entity of a given type shares the same klass pointer, so the
+	// scan only has to happen once per class instead of once per entity.
+	struct klass_name_t { uintptr_t klass; char name[ 48 ]; };
+	inline klass_name_t g_klass_names[ 512 ]{};
+
+	inline bool cached_class_name( uintptr_t obj, char* out, size_t cap ) {
+		if ( !out || cap == 0 ) return false;
+		out[ 0 ] = '\0';
+		const uintptr_t klass = unity::read_u64( obj );
+		if ( !klass ) return false;
+
+		klass_name_t& e = g_klass_names[ ( klass >> 4 ) & 511 ];
+		if ( e.klass == klass ) {
+			copy_str( out, cap, e.name );
+			return e.name[ 0 ] != '\0';
+		}
+
+		if ( !unity::get_class_name( obj, e.name, sizeof( e.name ) ) ) {
+			e.klass = 0;
+			return false;
+		}
+		e.klass = klass;
+		copy_str( out, cap, e.name );
+		return true;
+	}
+
 	inline void refresh_metadata_and_world_cache( ULONGLONG now, uintptr_t battle_model, uintptr_t entities_model, uintptr_t slots_model ) {
 		static ULONGLONG s_last_refresh = 0;
-		if ( s_last_refresh != 0 && ( now - s_last_refresh ) < 600 ) return;
+		if ( s_last_refresh != 0 && ( now - s_last_refresh ) < 800 ) return;
 		s_last_refresh = now;
 
 		g_meta_count = 0;
@@ -765,7 +811,7 @@ namespace esp {
 			if ( !unity::is_managed_ptr( emodel ) ) continue;
 
 			char cls[ 48 ]{};
-			if ( !unity::get_class_name( emodel, cls, sizeof( cls ) ) ) continue;
+			if ( !cached_class_name( emodel, cls, sizeof( cls ) ) ) continue;
 
 			if ( unity::str_eq( cls, "BattleCharacterEntityModel" ) || unity::str_eq( cls, "PlayerEntityModel" ) ) {
 				if ( g_meta_count >= 128 ) continue;
@@ -1053,6 +1099,9 @@ namespace esp {
 			g_bone_cache[ i ] = {};
 			g_vel_cache[ i ] = {};
 		}
+		for ( int i = 0; i < 512; ++i ) {
+			g_klass_names[ i ] = {};
+		}
 		g_player_count_buf[ 0 ] = 0;
 		g_player_count_buf[ 1 ] = 0;
 		g_world_count_buf[ 0 ] = 0;
@@ -1225,7 +1274,15 @@ namespace esp {
 		project_world_cache( );
 
 		if ( !unity::g_char_type_obj || !unity::m_obj_find_all ) return;
-		if ( s_last_scan == 0 || now - s_last_scan >= 1000 ) {
+		// FindObjectsOfType is a managed call that walks the whole scene: it is the
+		// main source of micro-freezes. Scan every 2 s and prune dead views between.
+		int alive_views = 0;
+		for ( int v = 0; v < s_view_count; ++v ) {
+			if ( unity::is_valid_obj( s_views[ v ] ) ) s_views[ alive_views++ ] = s_views[ v ];
+		}
+		s_view_count = alive_views;
+
+		if ( s_last_scan == 0 || now - s_last_scan >= 2000 ) {
 			s_last_scan = now;
 			s_view_count = 0;
 			void* args[ 1 ] = { unity::g_char_type_obj };
@@ -1295,6 +1352,11 @@ namespace esp {
 		int best_silent_idx = -1;
 		vec2_t best_silent_screen{};
 		int bone_budget = 2;
+		// Each player with a resolved skeleton costs 19 native transform reads per
+		// frame: 128 players in range is ~2400 managed calls every frame. Past ~80 m
+		// the real skeleton is a few dozen pixels tall and the screen-space figure
+		// reads better, so the bone work is capped per frame.
+		int skeleton_slots = 32;
 
 		for ( int i = 0; i < s_view_count && next_count < 256; ++i ) {
 			if ( !raw_ok[ i ] || i == local_idx ) continue;
@@ -1357,13 +1419,20 @@ namespace esp {
 				out.chest_screen = cs;
 				out.pelvis_screen = ps;
 
-				if ( dist <= 120.0f && ( config::esp_skeleton || config::esp_hitboxes ) ) {
+				if ( skeleton_slots > 0 && dist <= 80.0f && ( config::esp_skeleton || config::esp_hitboxes ) ) {
+					--skeleton_slots;
 					const bone_cache_t* bc = get_or_resolve_bones( p, now, bone_budget );
 					if ( bc ) {
 						int ok_cnt = 0;
 						vec3_t bpos{};
 						for ( int b = 0; b < k_bone_count; ++b ) {
 							if ( bc->native_bone_trs[ b ] && unity::get_transform_pos_native( bc->native_bone_trs[ b ], bpos ) ) {
+								// Reject bones that are nowhere near the body. A stale native pointer or
+								// a mismatched rig otherwise draws lines straight across the screen.
+								const float bone_dy = bpos.y - pos.y;
+								const float bone_dx = bpos.x - pos.x;
+								const float bone_dz = bpos.z - pos.z;
+								if ( bone_dy < -0.35f || bone_dy > 2.30f || ( bone_dx * bone_dx + bone_dz * bone_dz ) > 1.69f ) continue;
 								out.bones_world[ b ] = bpos;
 								if ( world_to_screen( bpos, out.bones[ b ] ) ) {
 									out.bone_ok[ b ] = true;
@@ -1484,7 +1553,7 @@ namespace esp {
 			g_locked_obj = dst[ best_aim_idx ].obj;
 			g_aim_target_screen = best_aim_screen;
 			g_has_aim_target = true;
-			if ( key_down ) {
+			if ( key_down && roll_percent( config::aim_hit_chance ) ) {
 				if ( config::aim_mode == 1 ) apply_direct_3d_aim( battle_model, best_aim_world );
 				else if ( config::aim_mode == 0 ) apply_mouse_aim_delta( best_aim_screen.x - cx, best_aim_screen.y - cy );
 			} else {
@@ -1511,12 +1580,15 @@ namespace esp {
 
 		// Triggerbot
 		static ULONGLONG s_trig_last = 0;
+		static bool s_trig_armed = true;
+		if ( !config::trig_enabled || config::menu_open || !g_has_aim_target ) s_trig_armed = true;
 		if ( config::trig_enabled && !config::menu_open && g_has_aim_target ) {
 			const float tdx = g_aim_target_screen.x - cx;
 			const float tdy = g_aim_target_screen.y - cy;
-			if ( d3d11_ui::fast_sqrt( tdx * tdx + tdy * tdy ) <= config::trig_fov &&
+			if ( s_trig_armed && d3d11_ui::fast_sqrt( tdx * tdx + tdy * tdy ) <= config::trig_fov &&
 				 ( now - s_trig_last ) >= static_cast< ULONGLONG >( config::trig_delay_ms ) ) {
 				s_trig_last = now;
+				if ( config::trig_semi_auto ) s_trig_armed = false;
 				INPUT inp[ 2 ]{};
 				inp[ 0 ].type = INPUT_MOUSE;
 				inp[ 0 ].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
@@ -1541,73 +1613,103 @@ namespace esp {
 		return { r.r, r.g, r.b, r.a };
 	}
 
-	inline void draw_skeleton( const player_t& p, float box_w, const d3d11_ui::color_t& c ) {
+	// Bone index pairs (see k_human_bones) plus the maximum screen length of each
+	// segment, as a fraction of the ESP box height. A longer segment means the bone
+	// resolved to a bad transform, and drawing it is what produced the lines cutting
+	// straight across the body.
+	struct skel_seg_t { int a, b; float max_h; };
+	inline constexpr skel_seg_t k_skel_segs[] = {
+		{ 0, 1, 0.28f }, { 1, 2, 0.30f }, { 2, 3, 0.32f }, { 3, 4, 0.32f },      // spine
+		{ 2, 5, 0.26f }, { 5, 6, 0.24f }, { 6, 7, 0.36f }, { 7, 8, 0.32f },      // left arm
+		{ 2, 9, 0.26f }, { 9, 10, 0.24f }, { 10, 11, 0.36f }, { 11, 12, 0.32f }, // right arm
+		{ 4, 13, 0.32f }, { 13, 14, 0.45f }, { 14, 15, 0.35f },                  // left leg
+		{ 4, 16, 0.32f }, { 16, 17, 0.45f }, { 17, 18, 0.35f }                   // right leg
+	};
+	inline constexpr int k_skel_seg_count = static_cast< int >( sizeof( k_skel_segs ) / sizeof( k_skel_segs[ 0 ] ) );
+
+	inline bool skeleton_segment_ok( const player_t& p, const skel_seg_t& s, float body_h ) {
+		if ( !p.bone_ok[ s.a ] || !p.bone_ok[ s.b ] ) return false;
+		const float dx = p.bones[ s.a ].x - p.bones[ s.b ].x;
+		const float dy = p.bones[ s.a ].y - p.bones[ s.b ].y;
+		const float len = d3d11_ui::fast_sqrt( dx * dx + dy * dy );
+		return len > 0.5f && len <= body_h * s.max_h;
+	}
+
+	inline void draw_skeleton_real( const player_t& p, float body_h, const d3d11_ui::color_t& c, const d3d11_ui::color_t& shadow, float lw ) {
+		for ( int i = 0; i < k_skel_seg_count; ++i ) {
+			const skel_seg_t& s = k_skel_segs[ i ];
+			if ( !skeleton_segment_ok( p, s, body_h ) ) continue;
+			d3d11_ui::add_line( p.bones[ s.a ].x, p.bones[ s.a ].y, p.bones[ s.b ].x, p.bones[ s.b ].y, lw + 1.2f, shadow );
+			d3d11_ui::add_line( p.bones[ s.a ].x, p.bones[ s.a ].y, p.bones[ s.b ].x, p.bones[ s.b ].y, lw, c );
+		}
+
+		if ( !p.bone_ok[ 0 ] ) return;
+		float hr = d3d11_ui::clampf( body_h * 0.075f, 2.5f, 22.0f );
+		if ( p.bone_ok[ 1 ] ) {
+			const float dx = p.bones[ 0 ].x - p.bones[ 1 ].x;
+			const float dy = p.bones[ 0 ].y - p.bones[ 1 ].y;
+			const float d = d3d11_ui::fast_sqrt( dx * dx + dy * dy );
+			if ( d > 1.0f ) hr = d3d11_ui::clampf( d * 0.62f, 2.5f, 22.0f );
+		}
+		d3d11_ui::add_circle( p.bones[ 0 ].x, p.bones[ 0 ].y, hr, 18, lw + 1.1f, shadow );
+		d3d11_ui::add_circle( p.bones[ 0 ].x, p.bones[ 0 ].y, hr, 18, lw, c );
+	}
+
+	// Fallback figure drawn entirely in screen space. Building it from the 3D
+	// look_dir put the elbows and hands in front of the torso when the character
+	// faced the camera, which is exactly what made it unreadable.
+	inline void draw_skeleton_fallback( const player_t& p, float body_h, const d3d11_ui::color_t& c, const d3d11_ui::color_t& shadow, float lw ) {
+		const float bottom = p.root_screen.y;
+		const float h = body_h > 8.0f ? body_h : 8.0f;
+		const float top = bottom - h;
+		const float cx = ( p.head_screen.x + p.root_screen.x ) * 0.5f;
+
+		const float neck_y = top + h * 0.155f;
+		const float shoulder_y = top + h * 0.195f;
+		const float hand_y = top + h * 0.47f;
+		const float pelvis_y = top + h * 0.52f;
+
+		const float sh_w = h * 0.115f;
+		const float hand_w = h * 0.205f;
+		const float foot_w = h * 0.115f;
+
+		auto seg = [ & ]( float x1, float y1, float x2, float y2 ) {
+			d3d11_ui::add_line( x1, y1, x2, y2, lw + 1.1f, shadow );
+			d3d11_ui::add_line( x1, y1, x2, y2, lw, c );
+		};
+
+		seg( cx, neck_y, cx, pelvis_y );                          // spine
+		seg( cx, shoulder_y, cx - sh_w, shoulder_y );             // left clavicle
+		seg( cx, shoulder_y, cx + sh_w, shoulder_y );             // right clavicle
+		seg( cx - sh_w, shoulder_y, cx - hand_w, hand_y );        // left arm
+		seg( cx + sh_w, shoulder_y, cx + hand_w, hand_y );        // right arm
+		seg( cx, pelvis_y, cx - foot_w, bottom );                 // left leg
+		seg( cx, pelvis_y, cx + foot_w, bottom );                 // right leg
+
+		const float hr = d3d11_ui::clampf( h * 0.075f, 2.5f, 22.0f );
+		const float hy = top + h * 0.085f;
+		d3d11_ui::add_circle( cx, hy, hr, 18, lw + 1.1f, shadow );
+		d3d11_ui::add_circle( cx, hy, hr, 18, lw, c );
+	}
+
+	inline void draw_skeleton( const player_t& p, float body_h, const d3d11_ui::color_t& c ) {
 		const float lw = config::esp_skel_width > 0.5f ? config::esp_skel_width : 1.3f;
 		const d3d11_ui::color_t shadow{ 0.0f, 0.0f, 0.0f, c.a * 0.85f };
+
 		if ( p.has_real_skeleton ) {
-			struct seg_t { int a, b; };
-			static constexpr seg_t k_segs[] = {
-				{ 0, 1 }, { 1, 2 }, { 2, 3 }, { 3, 4 },
-				{ 1, 5 }, { 5, 6 }, { 6, 7 }, { 7, 8 },
-				{ 1, 9 }, { 9, 10 }, { 10, 11 }, { 11, 12 },
-				{ 4, 13 }, { 13, 14 }, { 14, 15 },
-				{ 4, 16 }, { 16, 17 }, { 17, 18 }
-			};
-			for ( const auto& s : k_segs ) {
-				if ( p.bone_ok[ s.a ] && p.bone_ok[ s.b ] ) {
-					d3d11_ui::add_line( p.bones[ s.a ].x, p.bones[ s.a ].y, p.bones[ s.b ].x, p.bones[ s.b ].y, lw + 1.2f, shadow );
-					d3d11_ui::add_line( p.bones[ s.a ].x, p.bones[ s.a ].y, p.bones[ s.b ].x, p.bones[ s.b ].y, lw, c );
-				}
+			// At least half of the figure has to survive validation, otherwise one or
+			// two good bones end up stitched into a meaningless shape.
+			int valid = 0;
+			for ( int i = 0; i < k_skel_seg_count; ++i ) {
+				if ( skeleton_segment_ok( p, k_skel_segs[ i ], body_h ) ) ++valid;
 			}
-			if ( p.bone_ok[ 0 ] && p.bone_ok[ 1 ] ) {
-				const float dx = p.bones[ 0 ].x - p.bones[ 1 ].x;
-				const float dy = p.bones[ 0 ].y - p.bones[ 1 ].y;
-				const float r = d3d11_ui::clampf( d3d11_ui::fast_sqrt( dx * dx + dy * dy ) * 0.52f, 2.5f, 13.0f );
-				d3d11_ui::add_circle( p.bones[ 0 ].x, p.bones[ 0 ].y, r, 16, lw + 1.1f, shadow );
-				d3d11_ui::add_circle( p.bones[ 0 ].x, p.bones[ 0 ].y, r, 16, lw, c );
+			if ( valid >= 9 ) {
+				draw_skeleton_real( p, body_h, c, shadow, lw );
+				return;
 			}
-			return;
 		}
 
-		( void )box_w;
-		const float h = p.head_world.y - p.root_world.y;
-		if ( h < 0.4f ) return;
-		const float flen = d3d11_ui::fast_sqrt( p.look_dir.x * p.look_dir.x + p.look_dir.z * p.look_dir.z );
-		const vec3_t fwd = flen > 0.01f ? vec3_t{ p.look_dir.x / flen, 0.0f, p.look_dir.z / flen } : vec3_t{ g_cam_fwd.x, 0.0f, g_cam_fwd.z };
-		const vec3_t r{ fwd.z, 0.0f, -fwd.x };
-		const float sw = h * 0.14f, hw = h * 0.085f, ew = h * 0.17f;
-		const float arm_fwd = p.in_vehicle ? ( h * 0.18f ) : ( h * 0.04f );
-		const float knee_fwd = p.in_vehicle ? ( h * 0.24f ) : 0.0f;
-		const float knee_y = p.in_vehicle ? ( p.pelvis_world.y - 0.05f ) : ( p.root_world.y + h * 0.27f );
-
-		const vec3_t pts[ 16 ] = {
-			p.head_world, p.neck_world, p.chest_world, p.pelvis_world,
-			{ p.neck_world.x - r.x * sw, p.neck_world.y - 0.05f, p.neck_world.z - r.z * sw },
-			{ p.neck_world.x + r.x * sw, p.neck_world.y - 0.05f, p.neck_world.z + r.z * sw },
-			{ p.chest_world.x - r.x * ew + fwd.x * arm_fwd * 0.5f, p.chest_world.y - 0.06f, p.chest_world.z - r.z * ew + fwd.z * arm_fwd * 0.5f },
-			{ p.chest_world.x + r.x * ew + fwd.x * arm_fwd * 0.5f, p.chest_world.y - 0.06f, p.chest_world.z + r.z * ew + fwd.z * arm_fwd * 0.5f },
-			{ p.pelvis_world.x - r.x * ew + fwd.x * arm_fwd, p.pelvis_world.y + ( p.in_vehicle ? 0.18f : 0.02f ), p.pelvis_world.z - r.z * ew + fwd.z * arm_fwd },
-			{ p.pelvis_world.x + r.x * ew + fwd.x * arm_fwd, p.pelvis_world.y + ( p.in_vehicle ? 0.18f : 0.02f ), p.pelvis_world.z + r.z * ew + fwd.z * arm_fwd },
-			{ p.pelvis_world.x - r.x * hw, p.pelvis_world.y, p.pelvis_world.z - r.z * hw },
-			{ p.pelvis_world.x + r.x * hw, p.pelvis_world.y, p.pelvis_world.z + r.z * hw },
-			{ p.pelvis_world.x - r.x * hw + fwd.x * knee_fwd, knee_y, p.pelvis_world.z - r.z * hw + fwd.z * knee_fwd },
-			{ p.pelvis_world.x + r.x * hw + fwd.x * knee_fwd, knee_y, p.pelvis_world.z + r.z * hw + fwd.z * knee_fwd },
-			{ p.root_world.x - r.x * hw + fwd.x * knee_fwd, p.root_world.y, p.root_world.z - r.z * hw + fwd.z * knee_fwd },
-			{ p.root_world.x + r.x * hw + fwd.x * knee_fwd, p.root_world.y, p.root_world.z + r.z * hw + fwd.z * knee_fwd }
-		};
-		vec2_t sc[ 16 ]{};
-		for ( int i = 0; i < 16; ++i ) if ( !world_to_screen( pts[ i ], sc[ i ] ) ) return;
-
-		static constexpr int segs[ 15 ][ 2 ] = {
-			{0,1},{1,2},{2,3},{1,4},{4,6},{6,8},{1,5},{5,7},{7,9},{3,10},{10,12},{12,14},{3,11},{11,13},{13,15}
-		};
-		for ( int i = 0; i < 15; ++i ) {
-			d3d11_ui::add_line( sc[ segs[i][0] ].x, sc[ segs[i][0] ].y, sc[ segs[i][1] ].x, sc[ segs[i][1] ].y, lw + 1.1f, shadow );
-			d3d11_ui::add_line( sc[ segs[i][0] ].x, sc[ segs[i][0] ].y, sc[ segs[i][1] ].x, sc[ segs[i][1] ].y, lw, c );
-		}
-		const float hr = d3d11_ui::clampf( dist3( {sc[0].x, sc[0].y, 0}, {sc[1].x, sc[1].y, 0} ) * 0.52f, 2.5f, 13.0f );
-		d3d11_ui::add_circle( sc[ 0 ].x, sc[ 0 ].y, hr, 16, lw + 1.1f, shadow );
-		d3d11_ui::add_circle( sc[ 0 ].x, sc[ 0 ].y, hr, 16, lw, c );
+		draw_skeleton_fallback( p, body_h, c, shadow, lw );
 	}
 
 	inline void draw_3d_hitboxes( const player_t& p, const d3d11_ui::color_t& c ) {
@@ -1695,8 +1797,15 @@ namespace esp {
 
 			d3d11_ui::add_filled_circle( it.screen_pos.x, it.screen_pos.y - 8.0f, 3.0f, 8, { 0.0f, 0.0f, 0.0f, 0.85f } );
 			d3d11_ui::add_filled_circle( it.screen_pos.x, it.screen_pos.y - 8.0f, 2.0f, 8, c );
-			char buf[ 64 ]{};
-			wsprintfA( buf, "%s [%dm]", it.label[ 0 ] ? it.label : "ITEM", static_cast< int >( it.distance ) );
+			char buf[ 80 ]{};
+			char* bend = buf + sizeof( buf ) - 1;
+			char* bp = d3d11_ui::put_str( buf, bend, it.label[ 0 ] ? it.label : "ITEM" );
+			bp = d3d11_ui::put_char( bp, bend, ' ' );
+			bp = d3d11_ui::put_char( bp, bend, '[' );
+			bp = d3d11_ui::put_int( bp, bend, static_cast< int >( it.distance ) );
+			bp = d3d11_ui::put_char( bp, bend, 'm' );
+			bp = d3d11_ui::put_char( bp, bend, ']' );
+			*bp = '\0';
 			draw_esp_text( it.screen_pos.x, it.screen_pos.y + 4.0f, buf, c, 0.76f );
 		}
 	}
@@ -1733,19 +1842,29 @@ namespace esp {
 		if ( config::esp_radar ) render_radar( players, count );
 
 		if ( config::esp_death_point ) {
+			const ULONGLONG death_now = GetTickCount64( );
 			for ( int d = 0; d < 64; ++d ) {
 				if ( !g_deaths[ d ].valid ) continue;
+				// Markers used to live for the whole session: after 64 deaths the array
+				// was full and nothing new could be recorded for the rest of the match.
+				if ( death_now - g_deaths[ d ].tick > 300000ull ) {
+					g_deaths[ d ].valid = false;
+					continue;
+				}
 				vec2_t ds{};
 				if ( world_to_screen( g_deaths[ d ].pos, ds ) ) {
 					char dbuf[ 48 ]{};
-					wsprintfA( dbuf, "DEATH: %s", g_deaths[ d ].name );
+					char* dend = dbuf + sizeof( dbuf ) - 1;
+					char* dp = d3d11_ui::put_str( dbuf, dend, "DEATH: " );
+					dp = d3d11_ui::put_str( dp, dend, g_deaths[ d ].name );
+					*dp = '\0';
 					draw_esp_text( ds.x, ds.y, dbuf, { 0.95f, 0.35f, 0.35f, 0.85f }, 0.74f );
 				}
 			}
 		}
 
 		// Minimal noise on fire/aim (priority mode 6)
-		const bool minimal_noise = ( config::esp_priority_mode == 6 && g_is_firing_or_aiming );
+		const bool minimal_noise = ( config::esp_priority_mode == 2 && g_is_firing_or_aiming );
 		vec2_t drawn_labels[ 64 ]{};
 		int drawn_label_cnt = 0;
 
@@ -1787,6 +1906,9 @@ namespace esp {
 			const vec2_t& root_s = p.root_screen;
 			const float box_h = root_s.y - head_s.y;
 			if ( box_h < 4.0f || box_h > 1500.0f ) continue;
+			// Below ~9 px the labels are unreachable anyway; generating 6 outlined
+			// strings for them is pure vertex churn in big lobbies.
+			const bool tiny_target = box_h < 9.0f;
 			const float box_w = box_h * 0.52f;
 			const float box_x = head_s.x - box_w * 0.5f;
 			const float box_y = head_s.y;
@@ -1798,10 +1920,10 @@ namespace esp {
 				if ( config::esp_box_outline ) d3d11_ui::add_rect_outlined( box_x, box_y, box_w, box_h, 1.0f, col, { 0.0f, 0.0f, 0.0f, 0.72f } );
 				else d3d11_ui::add_rect( box_x, box_y, box_w, box_h, 1.0f, col );
 			}
-			if ( config::esp_skeleton && !minimal_noise ) {
-				draw_skeleton( p, box_w, { config::esp_col.skeleton.r, config::esp_col.skeleton.g, config::esp_col.skeleton.b, config::esp_col.skeleton.a } );
+			if ( config::esp_skeleton && !minimal_noise && !tiny_target ) {
+				draw_skeleton( p, box_h, { config::esp_col.skeleton.r, config::esp_col.skeleton.g, config::esp_col.skeleton.b, config::esp_col.skeleton.a } );
 			}
-			if ( config::esp_hitboxes && !minimal_noise ) {
+			if ( config::esp_hitboxes && !minimal_noise && !tiny_target ) {
 				draw_3d_hitboxes( p, { col.r, col.g, col.b, 0.75f } );
 			}
 			if ( config::esp_snaplines && !minimal_noise ) {
@@ -1812,7 +1934,7 @@ namespace esp {
 			}
 
 			// Overlap suppression (mode 1)
-			bool suppress_text = minimal_noise;
+			bool suppress_text = minimal_noise || tiny_target;
 			if ( config::esp_priority_mode == 1 ) {
 				for ( int k = 0; k < drawn_label_cnt; ++k ) {
 					if ( d3d11_ui::fast_sqrt( ( head_s.x - drawn_labels[ k ].x ) * ( head_s.x - drawn_labels[ k ].x ) +
@@ -1827,14 +1949,26 @@ namespace esp {
 				float ty = box_y - 12.0f;
 				if ( config::esp_name && ( p.name[ 0 ] || p.tag[ 0 ] ) ) {
 					char line[ 80 ]{};
-					if ( config::esp_role && p.tag[ 0 ] && p.name[ 0 ] ) wsprintfA( line, "[%s] %s", p.tag, p.name );
-					else wsprintfA( line, "%s", p.name[ 0 ] ? p.name : p.tag );
+					char* lend = line + sizeof( line ) - 1;
+					char* lp = line;
+					if ( config::esp_role && p.tag[ 0 ] && p.name[ 0 ] ) {
+						lp = d3d11_ui::put_char( lp, lend, '[' );
+						lp = d3d11_ui::put_str( lp, lend, p.tag );
+						lp = d3d11_ui::put_char( lp, lend, ']' );
+						lp = d3d11_ui::put_char( lp, lend, ' ' );
+					}
+					lp = d3d11_ui::put_str( lp, lend, p.name[ 0 ] ? p.name : p.tag );
+					*lp = '\0';
 					draw_esp_text( head_s.x, ty, line, col, 0.84f );
 					ty -= 13.0f;
 				}
 				if ( config::esp_clan && p.clan[ 0 ] ) {
 					char cbuf[ 40 ]{};
-					wsprintfA( cbuf, "<%s>", p.clan );
+					char* cend = cbuf + sizeof( cbuf ) - 1;
+					char* cp = d3d11_ui::put_char( cbuf, cend, '<' );
+					cp = d3d11_ui::put_str( cp, cend, p.clan );
+					cp = d3d11_ui::put_char( cp, cend, '>' );
+					*cp = '\0';
 					draw_esp_text( head_s.x, ty, cbuf, { 0.68f, 0.74f, 0.90f, 1.0f }, 0.76f );
 				}
 
@@ -1845,7 +1979,10 @@ namespace esp {
 				}
 				if ( config::esp_distance ) {
 					char dbuf[ 24 ]{};
-					wsprintfA( dbuf, "%dm", static_cast< int >( p.distance ) );
+					char* dend = dbuf + sizeof( dbuf ) - 1;
+					char* dp = d3d11_ui::put_int( dbuf, dend, static_cast< int >( p.distance ) );
+					dp = d3d11_ui::put_char( dp, dend, 'm' );
+					*dp = '\0';
 					draw_esp_text( head_s.x, by, dbuf, { 0.78f, 0.82f, 0.90f, 1.0f }, 0.76f );
 					by += 12.0f;
 				}

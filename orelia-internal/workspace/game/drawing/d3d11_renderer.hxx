@@ -61,6 +61,35 @@ namespace d3d11_ui {
 		return n;
 	}
 
+	// Append helpers for the hot paths. wsprintfA goes through user32 and parses a
+	// format string on every call; the ESP builds up to six strings per player and
+	// per frame, so labels are assembled by hand instead. Every helper takes the
+	// last writable byte so a truncated name can never overflow the buffer.
+	inline char* put_str( char* p, char* end, const char* s ) {
+		while ( s && *s && p < end ) *p++ = *s++;
+		return p;
+	}
+
+	inline char* put_char( char* p, char* end, char c ) {
+		if ( p < end ) *p++ = c;
+		return p;
+	}
+
+	inline char* put_int( char* p, char* end, int v ) {
+		if ( v < 0 ) {
+			p = put_char( p, end, '-' );
+			v = -v;
+		}
+		char tmp[ 12 ]{};
+		int n = 0;
+		do {
+			tmp[ n++ ] = static_cast< char >( '0' + ( v % 10 ) );
+			v /= 10;
+		} while ( v > 0 && n < 11 );
+		while ( n > 0 ) p = put_char( p, end, tmp[ --n ] );
+		return p;
+	}
+
 	inline void mem_cpy( void* dst, const void* src, size_t n ) {
 		if ( !dst || !src || !n ) return;
 		auto* d64 = static_cast< uint64_t* >( dst );
@@ -95,6 +124,7 @@ namespace d3d11_ui {
 	inline ID3D11SamplerState* g_sampler = nullptr;
 	inline ID3D11ShaderResourceView* g_font_srv = nullptr;
 	inline bool g_pipeline_ready = false;
+	inline ULONGLONG g_pipeline_next_try = 0;
 
 	constexpr int max_vertices = 131072;
 	inline vertex_t g_color_verts[ max_vertices ]{};
@@ -236,9 +266,7 @@ namespace d3d11_ui {
 		return SUCCEEDED( hr );
 	}
 
-	inline void release_pipeline( ) {
-		g_pipeline_ready = false;
-		if ( g_rtv ) { g_rtv->Release( ); g_rtv = nullptr; }
+	inline void release_states( ) {
 		if ( g_font_srv ) { g_font_srv->Release( ); g_font_srv = nullptr; }
 		if ( g_sampler ) { g_sampler->Release( ); g_sampler = nullptr; }
 		if ( g_depth ) { g_depth->Release( ); g_depth = nullptr; }
@@ -249,9 +277,31 @@ namespace d3d11_ui {
 		if ( g_ps_tex ) { g_ps_tex->Release( ); g_ps_tex = nullptr; }
 		if ( g_ps_color ) { g_ps_color->Release( ); g_ps_color = nullptr; }
 		if ( g_vs ) { g_vs->Release( ); g_vs = nullptr; }
+	}
+
+	// Called from ResizeBuffers: the render target and the cached size are stale.
+	inline void invalidate_back_buffer( ) {
+		if ( g_rtv ) { g_rtv->Release( ); g_rtv = nullptr; }
+		g_width = 0.0f;
+		g_height = 0.0f;
+	}
+
+	inline void release_pipeline( ) {
+		g_pipeline_ready = false;
+		release_states( );
+		if ( g_rtv ) { g_rtv->Release( ); g_rtv = nullptr; }
 		if ( g_context ) { g_context->Release( ); g_context = nullptr; }
 		if ( g_device ) { g_device->Release( ); g_device = nullptr; }
 		g_swap_chain = nullptr;
+	}
+
+	// A half built pipeline must not be retried 60 times per second: every attempt
+	// recreates COM objects and stalls the present thread.
+	inline bool pipeline_failed( ) {
+		release_states( );
+		g_pipeline_ready = false;
+		g_pipeline_next_try = GetTickCount64( ) + 1000;
+		return false;
 	}
 
 	inline bool init_pipeline( ) {
@@ -259,13 +309,15 @@ namespace d3d11_ui {
 			return true;
 		if ( !g_device || !g_context )
 			return false;
+		if ( g_pipeline_next_try != 0 && GetTickCount64( ) < g_pipeline_next_try )
+			return false;
 
 		if ( FAILED( g_device->CreateVertexShader( g_vs_bytecode, sizeof( g_vs_bytecode ), nullptr, &g_vs ) ) )
-			return false;
+			return pipeline_failed( );
 		if ( FAILED( g_device->CreatePixelShader( g_ps_color_bytecode, sizeof( g_ps_color_bytecode ), nullptr, &g_ps_color ) ) )
-			return false;
+			return pipeline_failed( );
 		if ( FAILED( g_device->CreatePixelShader( g_ps_tex_bytecode, sizeof( g_ps_tex_bytecode ), nullptr, &g_ps_tex ) ) )
-			return false;
+			return pipeline_failed( );
 
 		D3D11_INPUT_ELEMENT_DESC ied[] = {
 			{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
@@ -273,7 +325,7 @@ namespace d3d11_ui {
 			{ "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0 }
 		};
 		if ( FAILED( g_device->CreateInputLayout( ied, 3, g_vs_bytecode, sizeof( g_vs_bytecode ), &g_layout ) ) )
-			return false;
+			return pipeline_failed( );
 
 		D3D11_BUFFER_DESC bd{};
 		bd.Usage = D3D11_USAGE_DYNAMIC;
@@ -281,7 +333,7 @@ namespace d3d11_ui {
 		bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
 		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 		if ( FAILED( g_device->CreateBuffer( &bd, nullptr, &g_vb ) ) )
-			return false;
+			return pipeline_failed( );
 
 		D3D11_BLEND_DESC bdesc{};
 		bdesc.RenderTarget[ 0 ].BlendEnable = TRUE;
@@ -313,7 +365,7 @@ namespace d3d11_ui {
 		g_device->CreateSamplerState( &sdesc, &g_sampler );
 
 		if ( !create_font_atlas( ) )
-			return false;
+			return pipeline_failed( );
 
 		g_pipeline_ready = true;
 		return true;
@@ -646,17 +698,25 @@ namespace d3d11_ui {
 
 		DXGI_SWAP_CHAIN_DESC sd{};
 		if ( SUCCEEDED( swap_chain->GetDesc( &sd ) ) ) {
-			float w = static_cast< float >( sd.BufferDesc.Width );
-			float h = static_cast< float >( sd.BufferDesc.Height );
-			if ( w > 0.f && h > 0.f && ( w != g_width || h != g_height || g_swap_chain != swap_chain ) ) {
-				if ( g_rtv ) {
-					g_rtv->Release( );
-					g_rtv = nullptr;
-				}
-				g_width = w;
-				g_height = h;
-			}
 			g_hwnd = sd.OutputWindow;
+		}
+
+		// GetDesc keeps returning the *creation* size after ResizeBuffers, so the
+		// live size comes from the client rect / back buffer instead.
+		if ( g_hwnd ) {
+			RECT client{};
+			if ( GetClientRect( g_hwnd, &client ) ) {
+				const float cw = static_cast< float >( client.right - client.left );
+				const float ch = static_cast< float >( client.bottom - client.top );
+				if ( cw >= 1.0f && ch >= 1.0f && ( cw != g_width || ch != g_height ) ) {
+					if ( g_rtv ) {
+						g_rtv->Release( );
+						g_rtv = nullptr;
+					}
+					g_width = cw;
+					g_height = ch;
+				}
+			}
 		}
 
 		if ( !g_device || g_swap_chain != swap_chain ) {
@@ -677,13 +737,13 @@ namespace d3d11_ui {
 			ID3D11Texture2D* back_buffer = nullptr;
 			if ( SUCCEEDED( swap_chain->GetBuffer( 0, __uuidof( ID3D11Texture2D ), reinterpret_cast< void** >( &back_buffer ) ) ) && back_buffer ) {
 				g_device->CreateRenderTargetView( back_buffer, nullptr, &g_rtv );
-				back_buffer->Release( );
-			}
-			if ( SUCCEEDED( swap_chain->GetDesc( &sd ) ) ) {
-				if ( sd.BufferDesc.Width > 0 && sd.BufferDesc.Height > 0 ) {
-					g_width = static_cast< float >( sd.BufferDesc.Width );
-					g_height = static_cast< float >( sd.BufferDesc.Height );
+				D3D11_TEXTURE2D_DESC back_desc{};
+				back_buffer->GetDesc( &back_desc );
+				if ( back_desc.Width > 0 && back_desc.Height > 0 ) {
+					g_width = static_cast< float >( back_desc.Width );
+					g_height = static_cast< float >( back_desc.Height );
 				}
+				back_buffer->Release( );
 			}
 		}
 

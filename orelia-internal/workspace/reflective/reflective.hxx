@@ -44,7 +44,7 @@ std::uint64_t get_export( std::uint64_t module_base, const char* export_name ) {
 
     IMAGE_EXPORT_DIRECTORY* exports = ( IMAGE_EXPORT_DIRECTORY* )( module_base + export_directory->VirtualAddress );
     if ( exports->NumberOfFunctions == 0 ) {
-        return 1111;
+        return NULL;
     }
 
     DWORD* address_of_functions = ( DWORD* )( module_base + exports->AddressOfFunctions );
@@ -60,7 +60,7 @@ std::uint64_t get_export( std::uint64_t module_base, const char* export_name ) {
         }
     }
 
-    return exports->NumberOfNames;
+    return NULL;
 }
 
 typedef struct {

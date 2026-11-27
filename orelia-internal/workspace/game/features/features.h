@@ -13,13 +13,10 @@ namespace config {
 	inline int menu_tab = 0; // 0: Combat, 1: Visuals, 2: Radar/World, 3: Misc/Plots
 	inline int menu_key_mode = 0; // 0: INS/F8, 1: DEL, 2: HOME, 3: END, 4: F4
 	inline int theme_accent = 0;
-	inline bool show_diag = true;
 
 	// ---- Diagnostics ----
-	inline bool il2cpp_ready = false;
 	inline bool il2cpp_hook_ready = false;
 	inline bool il2cpp_hook_failed = false;
-	inline bool scene_ready = false;
 	inline bool model_chain_ok = false;
 	inline int diag_players_tracked = 0;
 	inline int diag_world_tracked = 0;
@@ -38,20 +35,17 @@ namespace config {
 	inline float aim_silent_fov = 95.0f;
 	inline float aim_hit_chance = 100.0f;
 	inline bool aim_silent_indicator = true;
-	inline bool aim_silent_cam_refine = true;
 	inline bool aim_draw_fov = true;
 	inline bool aim_draw_line = true;
 	inline bool aim_sticky = true;
 
 	inline bool trig_enabled = false;
 	inline float trig_delay_ms = 25.0f;
-	inline bool trig_spread_check = true;
 	inline bool trig_semi_auto = false;
 	inline float trig_fov = 16.0f;
 
 	inline bool rcs_enabled = false;
 	inline float rcs_strength = 0.85f;
-	inline bool rcs_direct_6b = false;
 	inline bool no_recoil = false;
 	inline bool no_spread = false;
 	inline bool no_cam_shake = false;
@@ -67,7 +61,6 @@ namespace config {
 	inline bool aim_multipoint = false;
 	inline float aim_multipoint_scale = 0.65f;
 	inline bool aim_vis_check = false;
-	inline int  aim_vis_mode = 0; // 0: Native Raycast, 1: Unity Raycast, 2: BVH + Veh Hull
 	inline bool aim_weapon_aware = false;
 
 	inline bool aim_ignore_clan = true;
@@ -128,8 +121,6 @@ namespace config {
 	inline bool world_containers = true;
 	inline bool world_hide_empty = true;
 	inline bool world_dropped = true;
-	inline bool world_veh_loot = true;
-	inline bool world_buyers = true;
 	// bitmask: bit 0=None, 1=Common, 2=Uncommon, 3=Rare, 4=Epic, 5=Legendary, 6=Exotic
 	inline uint32_t world_rarity_mask = 0x7F;
 	inline float world_loot_dist = 200.0f;
@@ -137,9 +128,6 @@ namespace config {
 
 	inline bool world_cars = true;
 	inline bool world_helis = true;
-	inline bool world_police_veh = true;
-	inline bool world_veh_occupants = true;
-	inline bool world_veh_details = true;
 	inline float world_veh_dist = 400.0f;
 	inline bool world_hide_local_veh = true;
 
@@ -161,10 +149,8 @@ namespace config {
 
 	inline bool player_list_open = false;
 	inline int  player_list_key = 0; // 0: TAB, 1: F2, 2: F3, 3: L
-	inline char player_search[ 32 ]{};
 
-	// 0: Z-Order, 1: Overlap Suppress, 2: Split Veh/Player, 3: Merge Single Occ,
-	// 4: Unified 2+ Crew, 5: Compact Crew >100m, 6: Minimal Noise on Fire/Aim
+	// 0: Z-Order, 1: Overlap Suppress, 2: Minimal Noise on Fire/Aim
 	inline int esp_priority_mode = 0;
 
 	// ---- Colors ----

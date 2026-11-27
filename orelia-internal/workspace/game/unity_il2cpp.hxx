@@ -86,14 +86,59 @@ namespace unity {
 	inline int g_attached_tid_count = 0;
 	inline volatile LONG g_attach_lock = 0;
 
-	// Page readability hash cache
+	// Page access cache: bit 0 = readable, bit 1 = writable.
+	// VirtualQuery is a kernel transition and the ESP path probes thousands of
+	// managed pointers per frame, so it is only called once per page.
+	constexpr uint8_t page_readable = 0x1;
+	constexpr uint8_t page_writable = 0x2;
 	inline uintptr_t g_page_cache_keys[ 8192 ]{};
 	inline uint8_t g_page_cache_vals[ 8192 ]{};
+
+	inline uint8_t page_flags( uintptr_t page ) {
+		page &= ~static_cast< uintptr_t >( 0xFFF );
+		if ( page < 0x10000ULL || page >= 0x00007FFFFFFF0000ULL ) return 0;
+		const uintptr_t idx = ( page >> 12 ) & 8191ULL;
+		if ( g_page_cache_keys[ idx ] == page ) return g_page_cache_vals[ idx ];
+
+		uint8_t flags = 0;
+		MEMORY_BASIC_INFORMATION mbi{};
+		if ( VirtualQuery( reinterpret_cast< LPCVOID >( page ), &mbi, sizeof( mbi ) ) == sizeof( mbi ) &&
+			 mbi.State == MEM_COMMIT && !( mbi.Protect & PAGE_GUARD ) ) {
+			const DWORD p = mbi.Protect & 0xFF;
+			if ( p == PAGE_READONLY || p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
+				 p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY ) {
+				flags |= page_readable;
+			}
+			if ( p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
+				 p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY ) {
+				flags |= page_writable;
+			}
+		}
+		g_page_cache_keys[ idx ] = page;
+		g_page_cache_vals[ idx ] = flags;
+		return flags;
+	}
+
+	inline char lower_ch( char c ) {
+		return ( c >= 'A' && c <= 'Z' ) ? static_cast< char >( c + 32 ) : c;
+	}
 
 	inline bool str_eq( const char* a, const char* b ) {
 		if ( !a || !b ) return false;
 		while ( *a && *b ) {
 			if ( *a != *b ) return false;
+			++a;
+			++b;
+		}
+		return *a == '\0' && *b == '\0';
+	}
+
+	// Case-insensitive compare, used for assembly / image names which come from
+	// the loader and are not guaranteed to keep the casing of the file on disk.
+	inline bool str_ieq( const char* a, const char* b ) {
+		if ( !a || !b ) return false;
+		while ( *a && *b ) {
+			if ( lower_ch( *a ) != lower_ch( *b ) ) return false;
 			++a;
 			++b;
 		}
@@ -114,33 +159,11 @@ namespace unity {
 	}
 
 	inline bool is_page_readable( uintptr_t page ) {
-		if ( page < 0x10000ULL || page >= 0x00007FFFFFFF0000ULL ) return false;
-		const uintptr_t idx = ( page >> 12 ) & 8191ULL;
-		if ( g_page_cache_keys[ idx ] == page ) {
-			return g_page_cache_vals[ idx ] != 0;
-		}
-		MEMORY_BASIC_INFORMATION mbi{};
-		uint8_t ok = 0;
-		if ( VirtualQuery( reinterpret_cast< LPCVOID >( page ), &mbi, sizeof( mbi ) ) == sizeof( mbi ) && mbi.State == MEM_COMMIT ) {
-			const DWORD p = mbi.Protect & 0xFF;
-			if ( !( mbi.Protect & PAGE_GUARD ) &&
-				 ( p == PAGE_READONLY || p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
-				   p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY ) ) {
-				ok = 1;
-			}
-		}
-		g_page_cache_keys[ idx ] = page;
-		g_page_cache_vals[ idx ] = ok;
-		return ok != 0;
+		return ( page_flags( page ) & page_readable ) != 0;
 	}
 
 	inline bool is_page_writable( uintptr_t page ) {
-		if ( page < 0x10000ULL || page >= 0x00007FFFFFFF0000ULL ) return false;
-		MEMORY_BASIC_INFORMATION mbi{};
-		if ( VirtualQuery( reinterpret_cast< LPCVOID >( page ), &mbi, sizeof( mbi ) ) != sizeof( mbi ) ) return false;
-		if ( mbi.State != MEM_COMMIT || ( mbi.Protect & PAGE_GUARD ) ) return false;
-		const DWORD p = mbi.Protect & 0xFF;
-		return p == PAGE_READWRITE || p == PAGE_WRITECOPY || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+		return ( page_flags( page ) & page_writable ) != 0;
 	}
 
 	inline bool is_mem_readable( uintptr_t addr, size_t size ) {

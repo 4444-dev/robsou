@@ -290,6 +290,15 @@ namespace unity {
 		return str_eq( nm, want );
 	}
 
+	// Substring match on the class name: il2cpp_class_get_name drops the namespace,
+	// so the exact name of a model is not knowable in advance, but the word that
+	// identifies it usually is.
+	inline bool obj_contains( uintptr_t obj, const char* want ) {
+		char nm[ 96 ]{};
+		if ( !get_class_name( obj, nm, sizeof( nm ) ) ) return false;
+		return str_icontains( nm, want );
+	}
+
 	inline int read_il2cpp_string( uintptr_t str_obj, char* out, size_t max_len ) {
 		if ( !out || max_len == 0 ) return 0;
 		out[ 0 ] = '\0';

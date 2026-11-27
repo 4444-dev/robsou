@@ -23,11 +23,36 @@ namespace dx11_hook {
 	constexpr LONG late_update_max_attempts = 20;
 	constexpr DWORD late_update_retry_ms = 500;
 
-	// Wiping the PE headers is a stealth measure, but it also destroys the export
-	// table: g_obs_slot and dpc_entry become unresolvable and the reflective
-	// loader can no longer find "DllMain". Only enable it if nothing resolves
-	// exports in this module after load.
-	constexpr bool wipe_headers = false;
+	inline void wipe_pe_headers( std::uint64_t module_base );
+
+	inline std::uint64_t g_self_base = 0;
+
+	// Wiping the PE headers destroys the export table, so it cannot happen while
+	// the loader may still resolve "DllMain", g_obs_slot or dpc_entry. It is
+	// therefore deferred: DllMain records the base, and the wipe runs from Present
+	// a few seconds in, once nothing can still be reading the headers.
+	inline void late_wipe_headers( ) {
+		static int s_frames = 0;
+		if ( g_self_base == 0 ) return;
+		if ( ++s_frames != 180 ) return;
+		__try {
+			wipe_pe_headers( g_self_base );
+		}
+		__except ( EXCEPTION_EXECUTE_HANDLER ) {
+		}
+	}
+
+	// Not a security boundary, but it keeps this thread out of a debugger's thread
+	// list, which is the first place anything looks for a foreign thread.
+	inline void hide_current_thread( ) {
+		HMODULE ntdll = GetModuleHandleA( "ntdll.dll" );
+		if ( !ntdll ) return;
+		using ntsit_fn = LONG( __stdcall* )( HANDLE, ULONG, void*, ULONG );
+		auto f_set_info = reinterpret_cast< ntsit_fn >( GetProcAddress( ntdll, "NtSetInformationThread" ) );
+		if ( !f_set_info ) return;
+		constexpr ULONG thread_hide_from_debugger = 17;
+		f_set_info( GetCurrentThread( ), thread_hide_from_debugger, nullptr, 0 );
+	}
 
 	inline void hk_late_update( void* self, void* method ) {
 		if ( o_late_update ) {
@@ -207,6 +232,7 @@ namespace dx11_hook {
 				menu::tick( );
 			}
 			d3d11_ui::render_frame( swap_chain );
+			late_wipe_headers( );
 		}
 		__except ( EXCEPTION_EXECUTE_HANDLER ) {
 			d3d11_ui::clear_batches( );
@@ -427,6 +453,12 @@ namespace dx11_hook {
 	// Runs on its own thread: creating a D3D11 device (and hooking vtables) from
 	// DllMain happens under the loader lock and can deadlock the process.
 	inline DWORD WINAPI init_thread( void* ) {
+		__try {
+			hide_current_thread( );
+		}
+		__except ( EXCEPTION_EXECUTE_HANDLER ) {
+		}
+
 		for ( int i = 0; i < 40; ++i ) {
 			if ( GetModuleHandleA( "dxgi.dll" ) ) break;
 			Sleep( 50 );
@@ -473,7 +505,7 @@ extern "C" __declspec( dllexport ) BOOL APIENTRY DllMain(
 	const std::uint64_t self = dx11_hook::resolve_self_base( module_base, reserved );
 	__try {
 		if ( self ) dx11_hook::register_seh_pdata( self );
-		if ( self && dx11_hook::wipe_headers ) dx11_hook::wipe_pe_headers( self );
+		if ( self ) dx11_hook::g_self_base = self;
 	}
 	__except ( EXCEPTION_EXECUTE_HANDLER ) {
 	}

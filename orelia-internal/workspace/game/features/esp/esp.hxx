@@ -671,12 +671,80 @@ namespace esp {
 		return true;
 	}
 
-	inline void apply_silent_target( uintptr_t battle_model, int32_t eid ) {
-		if ( !unity::is_managed_ptr( battle_model ) || eid <= 0 ) return;
-		const uintptr_t aim_m = unity::read_u64( battle_model + 0x198 ); // AimTargetModel
-		if ( !unity::is_managed_ptr( aim_m ) ) return;
-		unity::safe_write< int32_t >( aim_m + 0x10, eid );
-		unity::safe_write< int32_t >( aim_m + 0x14, 3 ); // 3 = character
+	// The aim-target model was taken from a fixed field and used blind. If that
+	// field holds something else - a different build, a different model layout -
+	// the write lands in an unrelated object and silently does nothing, which is
+	// exactly what "silent aim does not work" looks like. It is now identified by
+	// class name, with the known field tried first and a bounded scan after it.
+	inline uintptr_t find_aim_model( uintptr_t battle_model ) {
+		static uintptr_t s_battle = 0;
+		static uintptr_t s_model = 0;
+		if ( battle_model == s_battle && s_model &&
+			 unity::is_valid_obj( reinterpret_cast< void* >( s_model ) ) ) {
+			return s_model;
+		}
+		s_battle = battle_model;
+		s_model = 0;
+		if ( !unity::is_valid_obj( reinterpret_cast< void* >( battle_model ) ) ) return 0;
+
+		const uintptr_t direct = unity::read_u64( battle_model + 0x198 );
+		if ( unity::is_valid_obj( reinterpret_cast< void* >( direct ) ) && unity::obj_contains( direct, "AimTarget" ) ) {
+			s_model = direct;
+			return direct;
+		}
+		for ( uintptr_t off = 0x10; off <= 0x400; off += sizeof( void* ) ) {
+			const uintptr_t field = unity::read_u64( battle_model + off );
+			if ( !unity::is_valid_obj( reinterpret_cast< void* >( field ) ) ) continue;
+			if ( unity::obj_contains( field, "AimTarget" ) ) {
+				s_model = field;
+				return field;
+			}
+		}
+		return 0;
+	}
+
+	// Silent aim redirects the shot without moving the camera: the game reads its
+	// aim-target model when the shot resolves, so the entity id is written there
+	// while the trigger is held and the previous values are restored on release.
+	// Holding it permanently was wrong twice: the game clears the field between
+	// shots, and a field that never returns to its own value is what a server sees.
+	inline void apply_silent_target( uintptr_t battle_model, int32_t eid, bool active ) {
+		static uintptr_t s_model = 0;
+		static int32_t s_orig_id = 0;
+		static int32_t s_orig_type = 0;
+		static bool s_saved = false;
+		static bool s_written = false;
+
+		if ( !active || eid <= 0 ) {
+			if ( s_written && s_saved && s_model ) {
+				unity::safe_write< int32_t >( s_model + 0x10, s_orig_id );
+				unity::safe_write< int32_t >( s_model + 0x14, s_orig_type );
+			}
+			s_written = false;
+			return;
+		}
+
+		const uintptr_t model = find_aim_model( battle_model );
+		if ( !model ) return;
+
+		if ( model != s_model ) {
+			s_model = model;
+			s_saved = false;
+			s_written = false;
+		}
+		if ( !s_saved ) {
+			int32_t orig_id = 0;
+			int32_t orig_type = 0;
+			if ( !unity::safe_read< int32_t >( model + 0x10, orig_id ) ) return;
+			if ( !unity::safe_read< int32_t >( model + 0x14, orig_type ) ) return;
+			s_orig_id = orig_id;
+			s_orig_type = orig_type;
+			s_saved = true;
+		}
+
+		unity::safe_write< int32_t >( model + 0x10, eid );
+		unity::safe_write< int32_t >( model + 0x14, 3 ); // 3 = character
+		s_written = true;
 	}
 
 	inline int classify_role( const char* role_id, char* out_tag, size_t tag_cap ) {
@@ -1796,14 +1864,13 @@ namespace esp {
 		}
 
 		// Silent Aim
-		if ( config::aim_master && config::aim_mode == 2 && best_silent_idx >= 0 ) {
+		if ( config::aim_master && config::aim_mode == 2 && best_silent_idx >= 0 && dst[ best_silent_idx ].entity_id > 0 ) {
 			g_silent_target_screen = best_silent_screen;
 			g_has_silent_target = true;
-			if ( dst[ best_silent_idx ].entity_id > 0 ) {
-				apply_silent_target( battle_model, dst[ best_silent_idx ].entity_id );
-			}
+			apply_silent_target( battle_model, dst[ best_silent_idx ].entity_id, g_is_firing_or_aiming );
 		} else {
 			g_has_silent_target = false;
+			apply_silent_target( battle_model, -1, false );
 		}
 
 		// Triggerbot

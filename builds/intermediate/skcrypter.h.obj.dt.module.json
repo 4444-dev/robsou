@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\skcrypter.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\skcrypter.h.obj.dt.module.json",
+                "..\\builds\\intermediate\\skcrypter.h.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

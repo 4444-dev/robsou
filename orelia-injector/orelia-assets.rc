@@ -1,0 +1,5 @@
+#include "resource.h"
+
+IDR_ORELIA_DRIVER RCDATA "..\\builds\\enc_drv.bin"
+IDR_ORELIA_MAPPER RCDATA "..\\builds\\enc_map.bin"
+IDR_ORELIA_DLL RCDATA "..\\builds\\enc_dll.bin"

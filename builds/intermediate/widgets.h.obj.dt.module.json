@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\widgets.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\widgets.h.obj.dt.module.json",
+                "..\\builds\\intermediate\\widgets.h.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

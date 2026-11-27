@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\injector\\resolver.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\injector\\resolver.hxx.obj.dt.module.json",
+                "..\\builds\\intermediate\\injector\\resolver.hxx.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

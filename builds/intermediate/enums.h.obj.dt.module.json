@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\enums.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\enums.h.obj.dt.module.json",
+                "..\\builds\\intermediate\\enums.h.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

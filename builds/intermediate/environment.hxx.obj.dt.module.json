@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\environment.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\environment.hxx.obj.dt.module.json",
+                "..\\builds\\intermediate\\environment.hxx.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

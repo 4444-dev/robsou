@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\injector\\main.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\injector\\main.cxx.obj.dt.module.json",
+                "..\\builds\\intermediate\\injector\\main.cxx.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

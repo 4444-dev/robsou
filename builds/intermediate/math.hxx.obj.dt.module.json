@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\math.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\math.hxx.obj.dt.module.json",
+                "..\\builds\\intermediate\\math.hxx.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\targeting.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\targeting.hxx.obj.dt.module.json",
+                "..\\builds\\intermediate\\targeting.hxx.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

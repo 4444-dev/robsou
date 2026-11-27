@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\drawing.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\drawing.h.obj.dt.module.json",
+                "..\\builds\\intermediate\\drawing.h.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

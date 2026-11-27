@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\sdk.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\sdk.h.obj.dt.module.json",
+                "..\\builds\\intermediate\\sdk.h.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

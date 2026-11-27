@@ -1,0 +1,5 @@
+#pragma once
+
+#define IDR_ORELIA_DRIVER 101
+#define IDR_ORELIA_MAPPER 102
+#define IDR_ORELIA_DLL 103

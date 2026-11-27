@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\functions.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\functions.hxx.obj.dt.module.json",
+                "..\\builds\\intermediate\\functions.hxx.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

@@ -1,0 +1,21 @@
+# Visual Studio
+.vs/
+.vscode/
+*.suo
+*.user
+
+# Fichiers temporaires
+*.log
+*.tmp
+
+# Fichiers de compilation
+bin/
+obj/
+Debug/
+Release/
+x64/
+x86/
+
+# Fichiers système
+Thumbs.db
+Desktop.ini

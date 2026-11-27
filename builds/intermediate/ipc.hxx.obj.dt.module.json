@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\ipc.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\ipc.hxx.obj.dt.module.json",
+                "..\\builds\\intermediate\\ipc.hxx.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\players.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\players.hxx.obj.dt.module.json",
+                "..\\builds\\intermediate\\players.hxx.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

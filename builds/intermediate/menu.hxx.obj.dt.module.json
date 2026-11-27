@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\menu.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\menu.hxx.obj.dt.module.json",
+                "..\\builds\\intermediate\\menu.hxx.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

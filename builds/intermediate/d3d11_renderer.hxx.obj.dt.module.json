@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\d3d11_renderer.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\d3d11_renderer.hxx.obj.dt.module.json",
+                "..\\builds\\intermediate\\d3d11_renderer.hxx.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

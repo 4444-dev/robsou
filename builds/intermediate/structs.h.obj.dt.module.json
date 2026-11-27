@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\structs.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\structs.h.obj.dt.module.json",
+                "..\\builds\\intermediate\\structs.h.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

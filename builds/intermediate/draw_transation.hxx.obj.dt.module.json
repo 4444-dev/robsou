@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\draw_transation.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\draw_transation.hxx.obj.dt.module.json",
+                "..\\builds\\intermediate\\draw_transation.hxx.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

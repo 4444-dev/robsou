@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\reflective.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\reflective.hxx.obj.dt.module.json",
+                "..\\builds\\intermediate\\reflective.hxx.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

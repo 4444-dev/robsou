@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\internal.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\internal.h.obj.dt.module.json",
+                "..\\builds\\intermediate\\internal.h.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

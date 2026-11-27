@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "..\\builds\\intermediate\\renderer.obj",
+            "outputs": [
+                "..\\builds\\intermediate\\renderer.hxx.obj.dt.module.json",
+                "..\\builds\\intermediate\\renderer.hxx.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

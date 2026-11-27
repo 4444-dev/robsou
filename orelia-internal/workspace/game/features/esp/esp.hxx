@@ -223,6 +223,10 @@ namespace esp {
 		unsigned char eb[ 64 ]{};
 		int edge_count = 0;
 		unsigned char expanded[ 64 ]{};
+		// Native transform of each node, read once at resolve time. Reading the
+		// managed object's position per frame costs a managed call for every node;
+		// the native transform reads the same position without one.
+		uintptr_t native_nodes[ 64 ]{};
 		void* bone_trs[ k_bone_count ]{};
 		uintptr_t native_bone_trs[ k_bone_count ]{};
 		bool has_bones = false;
@@ -531,8 +535,13 @@ namespace esp {
 			}
 		}
 		if ( bc.edge_count >= 4 ) {
+			for ( int i = 0; i < bc.node_count; ++i ) {
+				bc.native_nodes[ i ] = unity::read_u64( reinterpret_cast< uintptr_t >( bc.nodes[ i ] ) + 0x10 );
+			}
 			bc.has_bones = true;
 			bc.resolved_tick = now;
+			config::diag_skel_nodes = bc.node_count;
+			config::diag_skel_edges = bc.edge_count;
 			return &bc;
 		}
 		return nullptr;
@@ -690,6 +699,7 @@ namespace esp {
 		const uintptr_t direct = unity::read_u64( battle_model + 0x198 );
 		if ( unity::is_valid_obj( reinterpret_cast< void* >( direct ) ) && unity::obj_contains( direct, "AimTarget" ) ) {
 			s_model = direct;
+			unity::get_class_name( direct, config::diag_aim_class, sizeof( config::diag_aim_class ) );
 			return direct;
 		}
 		for ( uintptr_t off = 0x10; off <= 0x400; off += sizeof( void* ) ) {
@@ -697,6 +707,7 @@ namespace esp {
 			if ( !unity::is_valid_obj( reinterpret_cast< void* >( field ) ) ) continue;
 			if ( unity::obj_contains( field, "AimTarget" ) ) {
 				s_model = field;
+				unity::get_class_name( field, config::diag_aim_class, sizeof( config::diag_aim_class ) );
 				return field;
 			}
 		}
@@ -721,6 +732,7 @@ namespace esp {
 				unity::safe_write< int32_t >( s_model + 0x14, s_orig_type );
 			}
 			s_written = false;
+			config::diag_silent_eid = -1;
 			return;
 		}
 
@@ -745,6 +757,7 @@ namespace esp {
 		unity::safe_write< int32_t >( model + 0x10, eid );
 		unity::safe_write< int32_t >( model + 0x14, 3 ); // 3 = character
 		s_written = true;
+		config::diag_silent_eid = eid;
 	}
 
 	inline int classify_role( const char* role_id, char* out_tag, size_t tag_cap ) {
@@ -1665,7 +1678,11 @@ namespace esp {
 				out.chest_screen = cs;
 				out.pelvis_screen = ps;
 
-				if ( skeleton_slots > 0 && dist <= 80.0f && ( config::esp_skeleton || config::esp_hitboxes ) ) {
+				// Below ~36 px the skeleton is not legible, and it is the heaviest thing
+				// drawn per player: skipping it there frees slots for the players that are
+				// actually readable on screen.
+				if ( skeleton_slots > 0 && dist <= 80.0f && ( config::esp_skeleton || config::esp_hitboxes ) &&
+					 ( rs.y - hs.y ) >= 36.0f ) {
 					--skeleton_slots;
 					const bone_cache_t* bc = get_or_resolve_bones( p, now, bone_budget );
 					if ( bc ) {
@@ -1702,7 +1719,8 @@ namespace esp {
 						if ( bc->edge_count > 0 ) {
 							for ( int n2 = 0; n2 < bc->node_count; ++n2 ) {
 								vec3_t np{};
-								const bool got = unity::get_transform_pos( bc->nodes[ n2 ], np );
+								const bool got = bc->native_nodes[ n2 ] != 0 &&
+									unity::get_transform_pos_native( bc->native_nodes[ n2 ], np );
 								out.skel_p_ok[ n2 ] = got && world_to_screen( np, out.skel_p[ n2 ] );
 								if ( !got ) continue;
 								// Only nodes that belong to this body feed the vertical extent.
@@ -2143,6 +2161,27 @@ namespace esp {
 		const float cy = d3d11_ui::g_height * 0.5f;
 		const ULONGLONG lu_tick = g_last_late_update_tick;
 		if ( !g_camera || !config::model_chain_ok || lu_tick == 0 || ( GetTickCount64( ) - lu_tick ) > 350 ) return;
+
+		// One line that answers the questions that took several rebuilds to answer by
+		// guesswork: does the hierarchy resolve, and did the aim model get found.
+		if ( config::show_diag ) {
+			char line[ 128 ]{};
+			char* end = line + sizeof( line ) - 1;
+			char* p = d3d11_ui::put_str( line, end, "SKEL " );
+			p = d3d11_ui::put_int( p, end, config::diag_skel_nodes );
+			p = d3d11_ui::put_str( p, end, " NODES / " );
+			p = d3d11_ui::put_int( p, end, config::diag_skel_edges );
+			p = d3d11_ui::put_str( p, end, " EDGES   AIM " );
+			p = d3d11_ui::put_str( p, end, config::diag_aim_class[ 0 ] ? config::diag_aim_class : "none" );
+			p = d3d11_ui::put_str( p, end, "   SILENT " );
+			if ( config::diag_silent_eid > 0 ) {
+				p = d3d11_ui::put_int( p, end, config::diag_silent_eid );
+			} else {
+				p = d3d11_ui::put_str( p, end, "idle" );
+			}
+			if ( p ) *p = '\0';
+			d3d11_ui::add_text( 18.0f, 120.0f, line, { 0.55f, 1.0f, 0.70f, 0.95f } );
+		}
 
 		if ( config::aim_master && config::aim_draw_fov ) {
 			d3d11_ui::add_circle( cx, cy, config::aim_fov, 64, 1.2f,

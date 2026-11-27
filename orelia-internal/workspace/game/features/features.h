@@ -19,6 +19,11 @@ namespace config {
 	inline bool il2cpp_hook_failed = false;
 	inline bool model_chain_ok = false;
 	inline int diag_players_tracked = 0;
+	inline bool show_diag = false;
+	inline int diag_skel_nodes = 0;
+	inline int diag_skel_edges = 0;
+	inline int diag_silent_eid = -1;
+	inline char diag_aim_class[ 48 ]{};
 	inline int diag_world_tracked = 0;
 	inline int diag_models_read = 0;
 	inline volatile LONG diag_seh_faults = 0;

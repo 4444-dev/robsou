@@ -281,6 +281,7 @@ namespace menu {
 			draw_chk( cx1, y1, cw, "FOV Changer", config::fov_changer_enabled );
 			draw_sld( cx1, y1, cw, "Custom FOV", config::fov_value, 60.0f, 130.0f, "%d" );
 			draw_chk( cx1, y1, cw, "Preserve ADS Zoom", config::fov_preserve_ads );
+			draw_chk( cx1, y1, cw, "Skeleton Diag Panel", config::show_diag );
 
 			draw_chk( cx2, y2, cw, "Instant Loot Reveal", config::instant_loot_reveal );
 			draw_cyc( cx2, y2, cw, "Door Toggle Key (6B)", config::door_toggle_key, k_dr_keys, 4 );

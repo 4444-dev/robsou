@@ -1617,22 +1617,36 @@ namespace esp {
 	// segment, as a fraction of the ESP box height. A longer segment means the bone
 	// resolved to a bad transform, and drawing it is what produced the lines cutting
 	// straight across the body.
-	struct skel_seg_t { int a, b; float max_h; };
+	// Bounds are in metres, because the distance between two bones does not depend
+	// on how far the player is from the camera. Judging by screen pixels meant the
+	// same rig was accepted at 5 m and rejected at 40 m.
+	struct skel_seg_t { int a, b; float min_m; float max_m; };
 	inline constexpr skel_seg_t k_skel_segs[] = {
-		{ 0, 1, 0.28f }, { 1, 2, 0.30f }, { 2, 3, 0.32f }, { 3, 4, 0.32f },      // spine
-		{ 2, 5, 0.26f }, { 5, 6, 0.24f }, { 6, 7, 0.36f }, { 7, 8, 0.32f },      // left arm
-		{ 2, 9, 0.26f }, { 9, 10, 0.24f }, { 10, 11, 0.36f }, { 11, 12, 0.32f }, // right arm
-		{ 4, 13, 0.32f }, { 13, 14, 0.45f }, { 14, 15, 0.35f },                  // left leg
-		{ 4, 16, 0.32f }, { 16, 17, 0.45f }, { 17, 18, 0.35f }                   // right leg
+		{ 0, 1, 0.01f, 0.30f }, { 1, 2, 0.01f, 0.30f }, { 2, 3, 0.01f, 0.35f }, { 3, 4, 0.01f, 0.40f }, // spine
+		{ 2, 5, 0.02f, 0.32f }, { 5, 6, 0.02f, 0.28f }, { 6, 7, 0.05f, 0.50f }, { 7, 8, 0.03f, 0.45f }, // left arm
+		{ 2, 9, 0.02f, 0.32f }, { 9, 10, 0.02f, 0.28f }, { 10, 11, 0.05f, 0.50f }, { 11, 12, 0.03f, 0.45f }, // right arm
+		{ 4, 13, 0.02f, 0.32f }, { 13, 14, 0.10f, 0.68f }, { 14, 15, 0.05f, 0.68f },                    // left leg
+		{ 4, 16, 0.02f, 0.32f }, { 16, 17, 0.10f, 0.68f }, { 17, 18, 0.05f, 0.68f }                     // right leg
 	};
 	inline constexpr int k_skel_seg_count = static_cast< int >( sizeof( k_skel_segs ) / sizeof( k_skel_segs[ 0 ] ) );
 
 	inline bool skeleton_segment_ok( const player_t& p, const skel_seg_t& s, float body_h ) {
 		if ( !p.bone_ok[ s.a ] || !p.bone_ok[ s.b ] ) return false;
+
+		const vec3_t& wa = p.bones_world[ s.a ];
+		const vec3_t& wb = p.bones_world[ s.b ];
+		const float wx = wa.x - wb.x;
+		const float wy = wa.y - wb.y;
+		const float wz = wa.z - wb.z;
+		const float world_len = d3d11_ui::fast_sqrt( wx * wx + wy * wy + wz * wz );
+		if ( world_len < s.min_m || world_len > s.max_m ) return false;
+
+		// Second gate in screen space: a correct rig never projects a limb longer than
+		// the body box, so anything that does is a stale transform.
 		const float dx = p.bones[ s.a ].x - p.bones[ s.b ].x;
 		const float dy = p.bones[ s.a ].y - p.bones[ s.b ].y;
-		const float len = d3d11_ui::fast_sqrt( dx * dx + dy * dy );
-		return len > 0.5f && len <= body_h * s.max_h;
+		const float screen_len = d3d11_ui::fast_sqrt( dx * dx + dy * dy );
+		return screen_len > 0.5f && screen_len <= body_h * 1.05f;
 	}
 
 	inline void draw_skeleton_real( const player_t& p, float body_h, const d3d11_ui::color_t& c, const d3d11_ui::color_t& shadow, float lw ) {
@@ -1696,14 +1710,16 @@ namespace esp {
 		const float lw = config::esp_skel_width > 0.5f ? config::esp_skel_width : 1.3f;
 		const d3d11_ui::color_t shadow{ 0.0f, 0.0f, 0.0f, c.a * 0.85f };
 
-		if ( p.has_real_skeleton ) {
-			// At least half of the figure has to survive validation, otherwise one or
-			// two good bones end up stitched into a meaningless shape.
+		{
+			// Four valid segments already read as a body. The previous gate demanded
+			// nine of eighteen, which a rig with six to ten resolved bones can never
+			// reach: the real skeleton was discarded in favour of the synthetic one
+			// even when the bones were perfectly good.
 			int valid = 0;
 			for ( int i = 0; i < k_skel_seg_count; ++i ) {
 				if ( skeleton_segment_ok( p, k_skel_segs[ i ], body_h ) ) ++valid;
 			}
-			if ( valid >= 9 ) {
+			if ( valid >= 4 ) {
 				draw_skeleton_real( p, body_h, c, shadow, lw );
 				return;
 			}

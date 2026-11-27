@@ -135,6 +135,11 @@ namespace config {
 	inline bool world_helis = true;
 	inline bool world_cameras = true;
 	inline bool world_doors = true;
+	// Loot objects carry their own taken flag in the dump (LootObjectModel._isTaken),
+	// so an emptied object can leave the ESP instead of staying as a dead label.
+	inline bool world_loot_objects = true;
+	// Safes report a real unlock state, which is more reliable than the door body flags.
+	inline bool world_safes = true;
 	// Offset of the item price inside the loot descriptor; -1 until the probe has been
 	// read back from the game. While it is -1 no amount is printed on world labels.
 	inline int world_value_off = -1;

@@ -1033,6 +1033,57 @@ namespace esp {
 		return false;
 	}
 
+	// World entity tables, read straight from the IL2CPP dump of this build
+	// (Models.Models.WorldEntities.WorldEntitiesModel):
+	//   0x20 _containers          0x38 _loots             0x48 _doors
+	//   0x90 _metalDetectors      0x98 _staticLootObjects 0xA0 _randomLootObjects
+	//   0xB0 _lootNodes           0x110 _safeDoors        0x128 _storages
+	//   0x148 _shelvings          0x210 _locationDoors    0x218 _builderDoors
+	// Every table is a Dictionary<int, Model> keyed by entity id, so one lookup gives
+	// the model of an entity that the entity-model scan already saw.
+	inline uintptr_t world_model_for_eid( uintptr_t world_m, size_t table_off, int32_t eid ) {
+		if ( !unity::is_managed_ptr( world_m ) || eid < 0 ) return 0;
+		uintptr_t entries = 0;
+		const int n = unity::read_dict( unity::read_u64( world_m + table_off ), entries );
+		for ( int i = 0; i < n; ++i ) {
+			const uintptr_t ent = entries + static_cast< size_t >( i ) * 0x18;
+			if ( unity::read_i32( ent ) != eid ) continue;
+			const uintptr_t model = unity::read_u64( ent + 0x10 );
+			return unity::is_managed_ptr( model ) ? model : 0;
+		}
+		return 0;
+	}
+
+	// LootObjectModel._isTaken @ 0x10 (dump: Models.Models.LootObjectModel). An emptied
+	// loot object is dropped from the world ESP instead of being drawn forever.
+	inline bool loot_object_taken( uintptr_t world_m, int32_t eid ) {
+		if ( !config::world_loot_objects ) return false;
+		uintptr_t model = world_model_for_eid( world_m, 0x98, eid );
+		if ( !model ) model = world_model_for_eid( world_m, 0xA0, eid );
+		if ( !model ) return false;
+		bool taken = false;
+		return unity::read_prim_data( unity::read_u64( model + 0x10 ), taken ) && taken;
+	}
+
+	// LocationSafeDoorModel guards the real safe state:
+	//   0x10 _isSafeDoorUnlockInProcessData  0x18 _isSafeDoorUnlockedData
+	// The body-flag guess used for swing doors says nothing about a safe, so when this
+	// lookup resolves it wins and the label reflects drilling / open / locked.
+	inline bool safe_door_state( uintptr_t world_m, int32_t eid, bool& unlocked, bool& in_process ) {
+		unlocked = false;
+		in_process = false;
+		if ( !config::world_safes ) return false;
+		const uintptr_t model = world_model_for_eid( world_m, 0x110, eid );
+		if ( !model ) return false;
+		bool u = false, p = false;
+		const bool ok_u = unity::read_prim_data( unity::read_u64( model + 0x18 ), u );
+		const bool ok_p = unity::read_prim_data( unity::read_u64( model + 0x10 ), p );
+		if ( !ok_u && !ok_p ) return false;
+		unlocked = ok_u && u;
+		in_process = ok_p && p;
+		return true;
+	}
+
 	inline int rarity_from_value( int base_price, int item_rarity ) {
 		if ( base_price > 0 ) {
 			if ( base_price >= 5000 ) return 5;
@@ -1283,6 +1334,7 @@ namespace esp {
 			}
 			else if ( config::world_master ) {
 				const int32_t eid = unity::read_i32( emodel + 0x10 );
+				const uintptr_t wtable = unity::is_managed_ptr( battle_model ) ? unity::read_u64( battle_model + 0x518 ) : 0;
 				if ( config::world_cars && unity::str_eq( cls, "CarEntityModel" ) ) {
 					const uintptr_t client_m = unity::read_u64( emodel + 0x20 );
 					if ( unity::is_managed_ptr( client_m ) ) {
@@ -1310,6 +1362,11 @@ namespace esp {
 								push_world_raw( eid, pos, WCAT_DROPPED, 2, false, "DROPPED LOOT" );
 							}
 						}
+					}
+				} else if ( config::world_containers && ( unity::str_icontains( cls, "Shelving" ) || unity::str_icontains( cls, "Trunk" ) ) ) {
+					vec3_t pos{};
+					if ( entity_world_pos( emodel, pos ) ) {
+						push_world_raw( eid, pos, WCAT_CONTAINER, 3, false, unity::str_icontains( cls, "Trunk" ) ? "TRUNK" : "SHELF" );
 					}
 				} else if ( config::world_containers && ( unity::str_icontains( cls, "Container" ) || unity::str_icontains( cls, "Locker" ) ||
 							 unity::str_icontains( cls, "Cabinet" ) || unity::str_icontains( cls, "Storage" ) ) ) {
@@ -1344,7 +1401,19 @@ namespace esp {
 						int32_t flags = 0;
 						const bool locked = door_flags_for_eid( world_m, battle_phys_data( battle_model ), eid, flags ) &&
 							( flags & 256 ) != 0;
-						push_world_raw( eid, pos, WCAT_DOOR, locked ? 3 : 1, false, locked ? "DOOR LOCKED" : "DOOR", 0, locked );
+						bool safe_open = false, safe_drilling = false;
+						if ( safe_door_state( wtable, eid, safe_open, safe_drilling ) ) {
+							push_world_raw( eid, pos, WCAT_DOOR, safe_open ? 2 : 4, false,
+											safe_open ? "SAFE OPEN" : safe_drilling ? "SAFE DRILLING" : "SAFE LOCKED", 0, !safe_open );
+						} else {
+							push_world_raw( eid, pos, WCAT_DOOR, locked ? 3 : 1, false, locked ? "DOOR LOCKED" : "DOOR", 0, locked );
+						}
+					}
+				} else if ( config::world_loot_objects && unity::str_icontains( cls, "LootObject" ) ) {
+					vec3_t pos{};
+					if ( entity_world_pos( emodel, pos ) ) {
+						if ( loot_object_taken( wtable, eid ) ) continue;
+						push_world_raw( eid, pos, WCAT_CONTAINER, 2, false, "LOOT OBJECT" );
 					}
 				} else if ( config::world_cameras && unity::str_icontains( cls, "Camera" ) ) {
 					vec3_t pos{};
@@ -1403,13 +1472,29 @@ namespace esp {
 						uint8_t is_empty = 0;
 						unity::read_prim_model( unity::read_u64( node_m + 0x30 ), is_empty );
 						if ( config::world_hide_empty && is_empty ) continue;
+						// LootNodeState: 0 Empty, 1 Small, 2 Half, 3 Full. Read as an int so a
+						// value outside the enum falls back to the plain bool above.
+						int32_t node_state = -1;
+						if ( !unity::read_prim_model( unity::read_u64( node_m + 0x30 ), node_state ) ||
+							 node_state < 0 || node_state > 3 ) {
+							node_state = -1;
+						}
 						const uintptr_t desc = unity::read_u64( node_m + 0x10 );
 						if ( !unity::is_managed_ptr( desc ) ) continue;
 						vec3_t pos{};
 						if ( unity::safe_read( desc + 0x38, pos ) ) {
 							char raw_id[ 32 ]{};
 							unity::read_enum_id( desc, raw_id, sizeof( raw_id ) );
-							push_world_raw( -1, pos, WCAT_NODE, 2, is_empty != 0, raw_id[ 0 ] ? raw_id : "NODE" );
+							char node_lbl[ 40 ]{};
+							copy_str( node_lbl, sizeof( node_lbl ), raw_id[ 0 ] ? raw_id : "NODE" );
+							if ( node_state >= 1 && node_state <= 3 ) {
+								const char* sfx = node_state == 3 ? " FULL" : node_state == 2 ? " HALF" : " SMALL";
+								size_t L = 0;
+								while ( node_lbl[ L ] ) ++L;
+								for ( int c = 0; sfx[ c ] && L + 1 < sizeof( node_lbl ); ++c ) node_lbl[ L++ ] = sfx[ c ];
+								node_lbl[ L ] = '\0';
+							}
+							push_world_raw( -1, pos, WCAT_NODE, 2, is_empty != 0, node_lbl );
 							const float pd = dist3( pos, g_cam_pos );
 							if ( pd < 55.0f ) {
 								if ( pd < best_plot_dist ) { best_plot_dist = pd; next_plot.distance = pd; next_plot.valid = true; }

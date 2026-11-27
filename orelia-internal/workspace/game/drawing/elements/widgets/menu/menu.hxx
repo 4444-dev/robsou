@@ -268,6 +268,8 @@ namespace menu {
 			draw_chk( cx2, y2, cw, "Helicopters ESP", config::world_helis );
 			draw_chk( cx2, y2, cw, "Cameras", config::world_cameras );
 			draw_chk( cx2, y2, cw, "Locked Doors", config::world_doors );
+			draw_chk( cx2, y2, cw, "Loot Objects", config::world_loot_objects );
+			draw_chk( cx2, y2, cw, "Safes & Vaults", config::world_safes );
 			draw_chk( cx2, y2, cw, "Hide Local Vehicle", config::world_hide_local_veh );
 			draw_sld( cx2, y2, cw, "Vehicle Render Dist", config::world_veh_dist, 50.0f, 800.0f, "%d m" );
 		} else {

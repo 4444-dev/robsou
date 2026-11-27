@@ -58,10 +58,10 @@ namespace esp {
 		// Skeleton rebuilt from the character's own transform hierarchy. This does
 		// not depend on an Animator, on a humanoid rig or on any field offset, so it
 		// is the path that actually attaches to the player.
-		vec2_t skel_p[ 48 ]{};
-		bool skel_p_ok[ 48 ]{};
-		unsigned char skel_ea[ 48 ]{};
-		unsigned char skel_eb[ 48 ]{};
+		vec2_t skel_p[ 64 ]{};
+		bool skel_p_ok[ 64 ]{};
+		unsigned char skel_ea[ 64 ]{};
+		unsigned char skel_eb[ 64 ]{};
 		int skel_edge_count = 0;
 
 		float distance = 0.0f;
@@ -217,11 +217,12 @@ namespace esp {
 	struct bone_cache_t {
 		void* view_obj = nullptr;
 		void* animator = nullptr;
-		void* nodes[ 48 ]{};
+		void* nodes[ 64 ]{};
 		int node_count = 0;
-		unsigned char ea[ 48 ]{};
-		unsigned char eb[ 48 ]{};
+		unsigned char ea[ 64 ]{};
+		unsigned char eb[ 64 ]{};
 		int edge_count = 0;
+		unsigned char expanded[ 64 ]{};
 		void* bone_trs[ k_bone_count ]{};
 		uintptr_t native_bone_trs[ k_bone_count ]{};
 		bool has_bones = false;
@@ -311,15 +312,19 @@ namespace esp {
 	// then the view's own reference fields are scanned for an instance whose class
 	// is exactly Animator: the name check means a wrong pointer can never be handed
 	// to GetBoneTransform.
-	constexpr int k_skel_max_nodes = 48;
+	constexpr int k_skel_max_nodes = 64;
+
+	inline int skel_index( bone_cache_t& bc, void* tr ) {
+		for ( int i = 0; i < bc.node_count; ++i ) {
+			if ( bc.nodes[ i ] == tr ) return i;
+		}
+		return -1;
+	}
 
 	inline void add_skel_edge( bone_cache_t& bc, void* a, void* b ) {
 		if ( !a || !b || bc.edge_count >= k_skel_max_nodes ) return;
-		int ia = -1, ib = -1;
-		for ( int i = 0; i < bc.node_count; ++i ) {
-			if ( bc.nodes[ i ] == a ) ia = i;
-			if ( bc.nodes[ i ] == b ) ib = i;
-		}
+		int ia = skel_index( bc, a );
+		int ib = skel_index( bc, b );
 		if ( ia < 0 ) {
 			if ( bc.node_count >= k_skel_max_nodes ) return;
 			ia = bc.node_count;
@@ -329,6 +334,11 @@ namespace esp {
 			if ( bc.node_count >= k_skel_max_nodes ) return;
 			ib = bc.node_count;
 			bc.nodes[ bc.node_count++ ] = b;
+		}
+		// A bone can be reached twice (chain edge, then as a child of a shallower
+		// node). Drawing it twice only doubles the cost and the brightness.
+		for ( int i = 0; i < bc.edge_count; ++i ) {
+			if ( ( bc.ea[ i ] == ia && bc.eb[ i ] == ib ) || ( bc.ea[ i ] == ib && bc.eb[ i ] == ia ) ) return;
 		}
 		bc.ea[ bc.edge_count ] = static_cast< unsigned char >( ia );
 		bc.eb[ bc.edge_count ] = static_cast< unsigned char >( ib );
@@ -353,6 +363,12 @@ namespace esp {
 			const float d2 = dx * dx + dy * dy + dz * dz;
 			if ( d2 < 0.0004f || d2 > 0.5625f ) continue;
 			add_skel_edge( bc, parent, child );
+			const int idx = skel_index( bc, child );
+			if ( idx >= 0 ) {
+				// Already walked from a deeper anchor: only the link is missing.
+				if ( bc.expanded[ idx ] ) continue;
+				bc.expanded[ idx ] = 1;
+			}
 			walk_skel_children( bc, child, cp, depth - 1 );
 		}
 	}
@@ -453,6 +469,7 @@ namespace esp {
 		// the spine is read by walking parents, then limbs by walking children.
 		bc.node_count = 0;
 		bc.edge_count = 0;
+		for ( int i = 0; i < k_skel_max_nodes; ++i ) bc.expanded[ i ] = 0;
 		void* head_tr = nullptr;
 		if ( unity::is_mem_readable( reinterpret_cast< uintptr_t >( view_obj ) + 0xE8, sizeof( void* ) ) ) {
 			head_tr = *reinterpret_cast< void** >( reinterpret_cast< uintptr_t >( view_obj ) + 0xE8 );
@@ -473,7 +490,22 @@ namespace esp {
 					++chain_n;
 				}
 				for ( int i = 0; i + 1 < chain_n; ++i ) add_skel_edge( bc, chain[ i ], chain[ i + 1 ] );
-				for ( int i = 0; i < chain_n; ++i ) walk_skel_children( bc, chain[ i ], chain_pos[ i ], 4 );
+
+				// Everything below is walked deepest first, and the head is walked last
+				// and shallow: a head with hair, a jaw and eyes has enough short children
+				// to consume the whole edge budget, which is exactly what left the legs
+				// missing while the arms were drawn.
+				for ( int i = 0; i < chain_n; ++i ) {
+					const int idx = skel_index( bc, chain[ i ] );
+					if ( idx >= 0 ) bc.expanded[ idx ] = 1;
+				}
+				for ( int i = chain_n - 1; i >= 1; --i ) {
+					if ( bc.edge_count >= k_skel_max_nodes ) break;
+					walk_skel_children( bc, chain[ i ], chain_pos[ i ], 4 );
+				}
+				if ( bc.edge_count < k_skel_max_nodes ) {
+					walk_skel_children( bc, chain[ 0 ], chain_pos[ 0 ], 2 );
+				}
 			}
 		}
 		if ( bc.edge_count >= 4 ) {

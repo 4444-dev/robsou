@@ -55,6 +55,15 @@ namespace esp {
 		bool bone_ok[ k_bone_count ]{};
 		bool has_real_skeleton = false;
 
+		// Skeleton rebuilt from the character's own transform hierarchy. This does
+		// not depend on an Animator, on a humanoid rig or on any field offset, so it
+		// is the path that actually attaches to the player.
+		vec2_t skel_p[ 48 ]{};
+		bool skel_p_ok[ 48 ]{};
+		unsigned char skel_ea[ 48 ]{};
+		unsigned char skel_eb[ 48 ]{};
+		int skel_edge_count = 0;
+
 		float distance = 0.0f;
 		float health = 1.0f;
 		float shield_value = 0.0f;
@@ -208,6 +217,11 @@ namespace esp {
 	struct bone_cache_t {
 		void* view_obj = nullptr;
 		void* animator = nullptr;
+		void* nodes[ 48 ]{};
+		int node_count = 0;
+		unsigned char ea[ 48 ]{};
+		unsigned char eb[ 48 ]{};
+		int edge_count = 0;
 		void* bone_trs[ k_bone_count ]{};
 		uintptr_t native_bone_trs[ k_bone_count ]{};
 		bool has_bones = false;
@@ -297,6 +311,52 @@ namespace esp {
 	// then the view's own reference fields are scanned for an instance whose class
 	// is exactly Animator: the name check means a wrong pointer can never be handed
 	// to GetBoneTransform.
+	constexpr int k_skel_max_nodes = 48;
+
+	inline void add_skel_edge( bone_cache_t& bc, void* a, void* b ) {
+		if ( !a || !b || bc.edge_count >= k_skel_max_nodes ) return;
+		int ia = -1, ib = -1;
+		for ( int i = 0; i < bc.node_count; ++i ) {
+			if ( bc.nodes[ i ] == a ) ia = i;
+			if ( bc.nodes[ i ] == b ) ib = i;
+		}
+		if ( ia < 0 ) {
+			if ( bc.node_count >= k_skel_max_nodes ) return;
+			ia = bc.node_count;
+			bc.nodes[ bc.node_count++ ] = a;
+		}
+		if ( ib < 0 ) {
+			if ( bc.node_count >= k_skel_max_nodes ) return;
+			ib = bc.node_count;
+			bc.nodes[ bc.node_count++ ] = b;
+		}
+		bc.ea[ bc.edge_count ] = static_cast< unsigned char >( ia );
+		bc.eb[ bc.edge_count ] = static_cast< unsigned char >( ib );
+		++bc.edge_count;
+	}
+
+	// Real children of a transform, depth limited. Only links between 2 cm and
+	// 75 cm are kept: that covers every human bone and rejects props attached to a
+	// bone, which is what used to draw lines away from the body.
+	inline void walk_skel_children( bone_cache_t& bc, void* parent, const vec3_t& pp, int depth ) {
+		if ( depth <= 0 || bc.edge_count >= k_skel_max_nodes ) return;
+		const int count = unity::tr_child_count( parent );
+		for ( int i = 0; i < count && i < 8; ++i ) {
+			if ( bc.edge_count >= k_skel_max_nodes ) return;
+			void* child = unity::tr_get_child( parent, i );
+			if ( !child ) continue;
+			vec3_t cp{};
+			if ( !unity::get_transform_pos( child, cp ) ) continue;
+			const float dx = cp.x - pp.x;
+			const float dy = cp.y - pp.y;
+			const float dz = cp.z - pp.z;
+			const float d2 = dx * dx + dy * dy + dz * dz;
+			if ( d2 < 0.0004f || d2 > 0.5625f ) continue;
+			add_skel_edge( bc, parent, child );
+			walk_skel_children( bc, child, cp, depth - 1 );
+		}
+	}
+
 	inline void* find_animator( void* view_obj ) {
 		if ( !unity::is_valid_obj( view_obj ) ) return nullptr;
 		const uintptr_t v = reinterpret_cast< uintptr_t >( view_obj );
@@ -339,7 +399,10 @@ namespace esp {
 		bone_cache_t& bc = g_bone_cache[ slot ];
 		// TTL: the GC reuses addresses, so a pointer-keyed cache without expiry ends
 		// up drawing the skeleton of a completely different player.
-		if ( bc.has_bones && ( now - bc.resolved_tick ) < 3000 && unity::is_valid_obj( bc.bone_trs[ 0 ] ) ) {
+		// The hierarchy path fills nodes/edges instead of bone_trs, so the cache must
+		// accept either source or it would re-resolve on every single frame.
+		if ( bc.has_bones && ( now - bc.resolved_tick ) < 3000 &&
+			( unity::is_valid_obj( bc.bone_trs[ 0 ] ) || ( bc.node_count > 0 && unity::is_valid_obj( bc.nodes[ 0 ] ) ) ) ) {
 			return &bc;
 		}
 		if ( budget <= 0 || ( bc.last_try != 0 && ( now - bc.last_try ) < 1500 ) ) {
@@ -385,12 +448,38 @@ namespace esp {
 				if ( unity::is_valid_obj( tr_chest ) ) bc.bone_trs[ 2 ] = tr_chest;
 			}
 		}
-		const uintptr_t spine_adapt = unity::read_u64( reinterpret_cast< uintptr_t >( view_obj ) + 0xF8 );
-		if ( unity::is_managed_ptr( spine_adapt ) ) {
-			void* tr_hips = reinterpret_cast< void* >( unity::read_u64( spine_adapt + 0x20 ) );
-			void* tr_spine = reinterpret_cast< void* >( unity::read_u64( spine_adapt + 0x28 ) );
-			if ( unity::is_valid_obj( tr_spine ) ) bc.bone_trs[ 3 ] = tr_spine;
-			if ( unity::is_valid_obj( tr_hips ) ) bc.bone_trs[ 4 ] = tr_hips;
+		// Fallback source: walk the character's own transform hierarchy. The head
+		// transform at view+0xE8 is proven to work (the ESP box is built from it), so
+		// the spine is read by walking parents, then limbs by walking children.
+		bc.node_count = 0;
+		bc.edge_count = 0;
+		void* head_tr = nullptr;
+		if ( unity::is_mem_readable( reinterpret_cast< uintptr_t >( view_obj ) + 0xE8, sizeof( void* ) ) ) {
+			head_tr = *reinterpret_cast< void** >( reinterpret_cast< uintptr_t >( view_obj ) + 0xE8 );
+		}
+		if ( unity::is_valid_obj( head_tr ) ) {
+			void* chain[ 6 ]{};
+			vec3_t chain_pos[ 6 ]{};
+			int chain_n = 0;
+			if ( unity::get_transform_pos( head_tr, chain_pos[ 0 ] ) ) {
+				chain[ chain_n++ ] = head_tr;
+				while ( chain_n < 6 ) {
+					void* par = unity::tr_get_parent( chain[ chain_n - 1 ] );
+					if ( !par ) break;
+					vec3_t pp{};
+					if ( !unity::get_transform_pos( par, pp ) ) break;
+					chain[ chain_n ] = par;
+					chain_pos[ chain_n ] = pp;
+					++chain_n;
+				}
+				for ( int i = 0; i + 1 < chain_n; ++i ) add_skel_edge( bc, chain[ i ], chain[ i + 1 ] );
+				for ( int i = 0; i < chain_n; ++i ) walk_skel_children( bc, chain[ i ], chain_pos[ i ], 4 );
+			}
+		}
+		if ( bc.edge_count >= 4 ) {
+			bc.has_bones = true;
+			bc.resolved_tick = now;
+			return &bc;
 		}
 		return nullptr;
 	}
@@ -1484,6 +1573,23 @@ namespace esp {
 							}
 						}
 						out.has_real_skeleton = ( ok_cnt >= 6 );
+
+						out.skel_edge_count = 0;
+						if ( bc->edge_count > 0 ) {
+							for ( int n2 = 0; n2 < bc->node_count; ++n2 ) {
+								vec3_t np{};
+								out.skel_p_ok[ n2 ] = unity::get_transform_pos( bc->nodes[ n2 ], np ) &&
+									world_to_screen( np, out.skel_p[ n2 ] );
+							}
+							for ( int e = 0; e < bc->edge_count; ++e ) {
+								const int ia = bc->ea[ e ];
+								const int ib = bc->eb[ e ];
+								if ( !out.skel_p_ok[ ia ] || !out.skel_p_ok[ ib ] ) continue;
+								out.skel_ea[ out.skel_edge_count ] = static_cast< unsigned char >( ia );
+								out.skel_eb[ out.skel_edge_count ] = static_cast< unsigned char >( ib );
+								++out.skel_edge_count;
+							}
+						}
 					}
 				}
 			}
@@ -1744,6 +1850,23 @@ namespace esp {
 	inline void draw_skeleton( const player_t& p, float body_h, const d3d11_ui::color_t& c ) {
 		const float lw = config::esp_skel_width > 0.5f ? config::esp_skel_width : 1.3f;
 		const d3d11_ui::color_t shadow{ 0.0f, 0.0f, 0.0f, c.a * 0.85f };
+
+		// Hierarchy skeleton first: those are the player's own transforms, so the
+		// shape follows the pose whatever the rig looks like.
+		if ( p.skel_edge_count >= 4 ) {
+			for ( int e = 0; e < p.skel_edge_count; ++e ) {
+				const vec2_t& sa = p.skel_p[ p.skel_ea[ e ] ];
+				const vec2_t& sb = p.skel_p[ p.skel_eb[ e ] ];
+				d3d11_ui::add_line( sa.x, sa.y, sb.x, sb.y, lw + 1.2f, shadow );
+				d3d11_ui::add_line( sa.x, sa.y, sb.x, sb.y, lw, c );
+			}
+			const float hr = d3d11_ui::clampf( body_h * 0.075f, 2.5f, 22.0f );
+			if ( p.skel_p_ok[ 0 ] ) {
+				d3d11_ui::add_circle( p.skel_p[ 0 ].x, p.skel_p[ 0 ].y, hr, 18, lw + 1.1f, shadow );
+				d3d11_ui::add_circle( p.skel_p[ 0 ].x, p.skel_p[ 0 ].y, hr, 18, lw, c );
+			}
+			return;
+		}
 
 		{
 			// Four valid segments already read as a body. The previous gate demanded

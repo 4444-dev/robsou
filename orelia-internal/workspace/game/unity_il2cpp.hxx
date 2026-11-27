@@ -28,6 +28,9 @@ namespace unity {
 	using tr_pos_inj_fn = void( * )( uintptr_t native_tr, vec3_t* out, void* method );
 	using tr_set_pos_inj_fn = void( * )( uintptr_t native_tr, const vec3_t* val, void* method );
 	using anim_get_bone_fn = void*( * )( void* animator, int bone_id, void* method );
+	using tr_get_parent_fn = void*( * )( void* tr, void* method );
+	using tr_child_count_fn = int( * )( void* tr, void* method );
+	using tr_get_child_fn = void*( * )( void* tr, int index, void* method );
 	using phys_linecast_fn = bool( * )( const vec3_t* start, const vec3_t* end, int layer_mask, int query_trigger, void* method );
 
 	inline bool g_ready = false;
@@ -60,6 +63,9 @@ namespace unity {
 	inline void* m_tr_set_pos_inj = nullptr;
 	inline void* m_obj_find_all = nullptr;
 	inline void* m_anim_get_bone = nullptr;
+	inline void* m_tr_get_parent = nullptr;
+	inline void* m_tr_child_count = nullptr;
+	inline void* m_tr_get_child = nullptr;
 	inline void* m_phys_linecast = nullptr;
 
 	// Direct native function pointers
@@ -72,6 +78,9 @@ namespace unity {
 	inline tr_pos_inj_fn fn_tr_pos_inj = nullptr;
 	inline tr_set_pos_inj_fn fn_tr_set_pos_inj = nullptr;
 	inline anim_get_bone_fn fn_anim_get_bone = nullptr;
+	inline tr_get_parent_fn fn_tr_get_parent = nullptr;
+	inline tr_child_count_fn fn_tr_child_count = nullptr;
+	inline tr_get_child_fn fn_tr_get_child = nullptr;
 	inline phys_linecast_fn fn_phys_linecast = nullptr;
 
 	// Cached RuntimeType objects
@@ -415,6 +424,24 @@ namespace unity {
 		return true;
 	}
 
+	inline void* tr_get_parent( void* tr ) {
+		if ( !fn_tr_get_parent || !m_tr_get_parent || !is_valid_obj( tr ) ) return nullptr;
+		void* parent = fn_tr_get_parent( tr, m_tr_get_parent );
+		return is_valid_obj( parent ) ? parent : nullptr;
+	}
+
+	inline int tr_child_count( void* tr ) {
+		if ( !fn_tr_child_count || !m_tr_child_count || !is_valid_obj( tr ) ) return 0;
+		const int count = fn_tr_child_count( tr, m_tr_child_count );
+		return ( count > 0 && count < 64 ) ? count : 0;
+	}
+
+	inline void* tr_get_child( void* tr, int index ) {
+		if ( !fn_tr_get_child || !m_tr_get_child || !is_valid_obj( tr ) ) return nullptr;
+		void* child = fn_tr_get_child( tr, index, m_tr_get_child );
+		return is_valid_obj( child ) ? child : nullptr;
+	}
+
 	inline void* get_animator_bone( void* animator, int human_bone_id ) {
 		if ( !fn_anim_get_bone || !m_anim_get_bone || !is_valid_obj( animator ) ) return nullptr;
 		void* tr = fn_anim_get_bone( animator, human_bone_id, m_anim_get_bone );
@@ -534,6 +561,14 @@ namespace unity {
 			m_tr_set_pos_inj = f_cls_method( tr_cls, "set_position_Injected", 2 );
 			fn_tr_pos_inj = extract_native_fn< tr_pos_inj_fn >( m_tr_pos_inj );
 			fn_tr_set_pos_inj = extract_native_fn< tr_set_pos_inj_fn >( m_tr_set_pos_inj );
+
+			// Hierarchy access: how the skeleton is read without any offset guess.
+			m_tr_get_parent = f_cls_method( tr_cls, "get_parent", 0 );
+			m_tr_child_count = f_cls_method( tr_cls, "get_childCount", 0 );
+			m_tr_get_child = f_cls_method( tr_cls, "GetChild", 1 );
+			fn_tr_get_parent = extract_native_fn< tr_get_parent_fn >( m_tr_get_parent );
+			fn_tr_child_count = extract_native_fn< tr_child_count_fn >( m_tr_child_count );
+			fn_tr_get_child = extract_native_fn< tr_get_child_fn >( m_tr_get_child );
 		}
 		if ( phys_img ) {
 			void* phys_cls = f_cls_from_name( phys_img, "UnityEngine", "Physics" );
